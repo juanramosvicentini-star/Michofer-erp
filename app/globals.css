@@ -249,6 +249,44 @@ select {
   min-height: 16px;
 }
 
+.payment-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.payment-option {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  background: #fff;
+  display: grid;
+  gap: 3px;
+  cursor: pointer;
+}
+
+.payment-option input {
+  width: 16px;
+  height: 16px;
+  min-height: 16px;
+  margin: 0;
+}
+
+.payment-option strong {
+  font-size: 0.9rem;
+  color: var(--ink);
+}
+
+.payment-option span {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.payment-option.active {
+  border-color: var(--brand);
+  background: #f3f7ff;
+}
+
 .message {
   min-height: 40px;
   border: 1px solid var(--line);
@@ -387,6 +425,54 @@ th {
   font-weight: 700;
 }
 
+.action-buttons {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.balance-positive {
+  color: #1f7a41;
+  font-weight: 700;
+}
+
+.balance-negative {
+  color: #b93535;
+  font-weight: 700;
+}
+
+.help-note {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.box-balance-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.box-balance-item {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  background: #f8faff;
+}
+
+.box-balance-item span {
+  display: block;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.box-balance-item strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 1.1rem;
+}
+
 @media (max-width: 980px) {
   .login-card {
     grid-template-columns: 1fr;
@@ -397,7 +483,12 @@ th {
     grid-template-columns: 1fr;
   }
 
-  .inline-options {
+  .inline-options,
+  .payment-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .box-balance-grid {
     grid-template-columns: 1fr;
   }
 }

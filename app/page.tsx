@@ -4,10 +4,13 @@ import Image from "next/image";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type TimeMode = "normal" | "peak";
-type PaymentMode = "cash" | "card";
 type CashEntryKind = "income" | "expense";
-type AppTab = "calculator" | "dashboard" | "cash" | "settings" | "audits";
+type PaymentMode = "cash" | "transfer" | "card" | "posnet" | "pending" | "advance";
+type CashBox = "cash" | "mercado_pago" | "galicia_paul";
 type StatusTone = "default" | "success" | "error";
+type IncomeReason = "manual" | "pending_payment";
+type ExpenseReason = "manual" | "commission_payment";
+type AppTab = "calculator" | "pending" | "dashboard" | "accounts" | "cash" | "settings" | "audits";
 
 type PricingConfig = {
   minimumFare: number;
@@ -20,10 +23,12 @@ type PricingConfig = {
   cardSurcharge: number;
   hotelSurcharge: number;
   defaultTolls: number;
+  hotelClientId: string;
 };
 
 type PermissionSet = {
   dashboard: boolean;
+  accounts: boolean;
   cash: boolean;
   settings: boolean;
   audits: boolean;
@@ -40,6 +45,7 @@ type AppUser = {
 type Driver = {
   id: string;
   name: string;
+  commissionRate: number;
 };
 
 type CorporateClient = {
@@ -47,22 +53,7 @@ type CorporateClient = {
   name: string;
 };
 
-type AuditEntry = {
-  id: string;
-  createdAt: string;
-  userName: string;
-  action: string;
-};
-
-type CashEntry = {
-  id: string;
-  createdAt: string;
-  concept: string;
-  amount: number;
-  kind: CashEntryKind;
-};
-
-type TripRecord = {
+type PendingTrip = {
   id: string;
   createdAt: string;
   driverId: string;
@@ -74,8 +65,57 @@ type TripRecord = {
   kilometers: number;
   durationSeconds: number;
   paymentMode: PaymentMode;
-  amount: number;
+  timeMode: TimeMode;
+  hotelTrip: boolean;
+  waitCharge: number;
+  tolls: number;
+  baseTotal: number;
+  cardSurcharge: number;
+  hotelFee: number;
+  totalAmount: number;
   notes: string;
+};
+
+type ConfirmedTrip = PendingTrip & {
+  confirmedAt: string;
+};
+
+type ClientLedgerEntry = {
+  id: string;
+  createdAt: string;
+  clientId: string;
+  clientName: string;
+  amount: number;
+  concept: string;
+  source: "trip" | "pending_payment" | "hotel" | "manual";
+};
+
+type DriverLedgerEntry = {
+  id: string;
+  createdAt: string;
+  driverId: string;
+  driverName: string;
+  amount: number;
+  concept: string;
+  source: "trip_commission" | "commission_payment" | "manual";
+};
+
+type CashEntry = {
+  id: string;
+  createdAt: string;
+  concept: string;
+  amount: number;
+  kind: CashEntryKind;
+  reason: "manual" | "pending_payment" | "commission_payment" | "trip_payment";
+  box: CashBox;
+  linkedName?: string;
+};
+
+type AuditEntry = {
+  id: string;
+  createdAt: string;
+  userName: string;
+  action: string;
 };
 
 type RouteSummary = {
@@ -131,13 +171,33 @@ const STORAGE_KEYS = {
   users: "miChoferUsers",
   drivers: "miChoferDrivers",
   clients: "miChoferClients",
-  trips: "miChoferTrips",
+  pendingTrips: "miChoferPendingTrips",
+  confirmedTrips: "miChoferConfirmedTrips",
+  clientLedger: "miChoferClientLedger",
+  driverLedger: "miChoferDriverLedger",
   audits: "miChoferAudits",
   cash: "miChoferCashEntries",
   maps: "miChoferGoogleMapsApiKey"
 };
 
 const DEFAULT_PUBLIC_GOOGLE_MAPS_API_KEY = "AIzaSyCbcYMbdwfcfrGFPQKs3qwKCNR0o53baJ0";
+
+const PAYMENT_OPTIONS: Array<{ value: PaymentMode; title: string; subtitle: string }> = [
+  { value: "cash", title: "Cobro efectivo", subtitle: "Pago en efectivo" },
+  { value: "transfer", title: "Cobro transferencia", subtitle: "Pago por banco" },
+  { value: "card", title: "Cobro tarjeta", subtitle: "Con recargo de tarjeta" },
+  { value: "posnet", title: "Cobro posnet", subtitle: "Con recargo de tarjeta" },
+  { value: "pending", title: "Saldo pendiente", subtitle: "Se adeuda en cuenta corriente" },
+  { value: "advance", title: "Saldo adelantado", subtitle: "Se descuenta del saldo a favor" }
+];
+
+const CASH_BOX_OPTIONS: Array<{ value: CashBox; label: string }> = [
+  { value: "cash", label: "Caja efectivo" },
+  { value: "mercado_pago", label: "Caja Mercado Pago" },
+  { value: "galicia_paul", label: "Caja Tarjeta Galicia Paul" }
+];
+
+const MERCADO_PAGO_DISCOUNT_RATE = 0.12;
 
 const DEFAULT_CONFIG: PricingConfig = {
   minimumFare: 15000,
@@ -149,7 +209,8 @@ const DEFAULT_CONFIG: PricingConfig = {
   peakMultiplier: 1.15,
   cardSurcharge: 0.15,
   hotelSurcharge: 0.05,
-  defaultTolls: 0
+  defaultTolls: 0,
+  hotelClientId: "client-2"
 };
 
 const DEFAULT_USERS: AppUser[] = [
@@ -160,6 +221,7 @@ const DEFAULT_USERS: AppUser[] = [
     password: "Michofer2026",
     permissions: {
       dashboard: true,
+      accounts: true,
       cash: true,
       settings: true,
       audits: true
@@ -172,6 +234,7 @@ const DEFAULT_USERS: AppUser[] = [
     password: "Chofer2026",
     permissions: {
       dashboard: false,
+      accounts: false,
       cash: false,
       settings: false,
       audits: false
@@ -180,8 +243,8 @@ const DEFAULT_USERS: AppUser[] = [
 ];
 
 const DEFAULT_DRIVERS: Driver[] = [
-  { id: "driver-1", name: "Franco Diaz" },
-  { id: "driver-2", name: "Martin Rojas" }
+  { id: "driver-1", name: "Franco Diaz", commissionRate: 0.65 },
+  { id: "driver-2", name: "Martin Rojas", commissionRate: 0.65 }
 ];
 
 const DEFAULT_CLIENTS: CorporateClient[] = [
@@ -196,6 +259,14 @@ function makeId(prefix: string) {
 function safeNumber(value: unknown, fallback: number) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function normalizeName(value: string) {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function normalizeUsername(value: string) {
+  return value.trim().toLowerCase();
 }
 
 function formatCurrency(value: number) {
@@ -216,14 +287,6 @@ function formatDuration(totalSeconds: number) {
   return `${hours} h ${remainingMinutes} min`;
 }
 
-function normalizeUsername(value: string) {
-  return value.trim().toLowerCase();
-}
-
-function normalizeName(value: string) {
-  return value.trim().replace(/\s+/g, " ");
-}
-
 function mergeConfig(raw: Partial<PricingConfig> | null): PricingConfig {
   if (!raw) {
     return {
@@ -242,8 +305,36 @@ function mergeConfig(raw: Partial<PricingConfig> | null): PricingConfig {
     peakMultiplier: Math.max(1, safeNumber(raw.peakMultiplier, DEFAULT_CONFIG.peakMultiplier)),
     cardSurcharge: Math.max(0, safeNumber(raw.cardSurcharge, DEFAULT_CONFIG.cardSurcharge)),
     hotelSurcharge: Math.max(0, safeNumber(raw.hotelSurcharge, DEFAULT_CONFIG.hotelSurcharge)),
-    defaultTolls: Math.max(0, safeNumber(raw.defaultTolls, DEFAULT_CONFIG.defaultTolls))
+    defaultTolls: Math.max(0, safeNumber(raw.defaultTolls, DEFAULT_CONFIG.defaultTolls)),
+    hotelClientId: raw.hotelClientId || DEFAULT_CONFIG.hotelClientId
   };
+}
+
+function normalizeUsers(rawUsers: AppUser[]): AppUser[] {
+  return rawUsers.map((user) => ({
+    ...user,
+    permissions: {
+      dashboard: Boolean(user.permissions?.dashboard),
+      accounts: Boolean((user.permissions as Partial<PermissionSet>)?.accounts),
+      cash: Boolean(user.permissions?.cash),
+      settings: Boolean(user.permissions?.settings),
+      audits: Boolean(user.permissions?.audits)
+    }
+  }));
+}
+
+function normalizeDrivers(rawDrivers: Driver[]): Driver[] {
+  return rawDrivers.map((driver) => ({
+    ...driver,
+    commissionRate: Math.min(1, Math.max(0, safeNumber(driver.commissionRate, 0.65)))
+  }));
+}
+
+function normalizeCashEntries(rawEntries: CashEntry[]): CashEntry[] {
+  return rawEntries.map((entry) => ({
+    ...entry,
+    box: entry.box || "cash"
+  }));
 }
 
 function calculateTieredDistancePrice(distanceKm: number, config: PricingConfig) {
@@ -266,29 +357,37 @@ function getRouteError(status: string) {
     REQUEST_DENIED: "Google Maps rechazo la solicitud. Revisa la API key.",
     INVALID_REQUEST: "La solicitud de ruta esta incompleta."
   };
-
   return messages[status] || "No se pudo calcular la ruta en este momento.";
 }
 
+function getPaymentUsesCardSurcharge(paymentMode: PaymentMode) {
+  return paymentMode === "card" || paymentMode === "posnet";
+}
+
+function getCashBoxLabel(box: CashBox) {
+  return CASH_BOX_OPTIONS.find((item) => item.value === box)?.label || box;
+}
+
 export default function Home() {
-  const [config, setConfig] = useState<PricingConfig>({
-    ...DEFAULT_CONFIG,
-    rates: { ...DEFAULT_CONFIG.rates }
-  });
+  const [config, setConfig] = useState<PricingConfig>({ ...DEFAULT_CONFIG, rates: { ...DEFAULT_CONFIG.rates } });
   const [users, setUsers] = useState<AppUser[]>(DEFAULT_USERS);
   const [drivers, setDrivers] = useState<Driver[]>(DEFAULT_DRIVERS);
   const [clients, setClients] = useState<CorporateClient[]>(DEFAULT_CLIENTS);
-  const [trips, setTrips] = useState<TripRecord[]>([]);
-  const [audits, setAudits] = useState<AuditEntry[]>([]);
+
+  const [pendingTrips, setPendingTrips] = useState<PendingTrip[]>([]);
+  const [confirmedTrips, setConfirmedTrips] = useState<ConfirmedTrip[]>([]);
+  const [clientLedger, setClientLedger] = useState<ClientLedgerEntry[]>([]);
+  const [driverLedger, setDriverLedger] = useState<DriverLedgerEntry[]>([]);
   const [cashEntries, setCashEntries] = useState<CashEntry[]>([]);
+  const [audits, setAudits] = useState<AuditEntry[]>([]);
 
   const [sessionUserId, setSessionUserId] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<AppTab>("calculator");
+  const [hasHydrated, setHasHydrated] = useState(false);
+
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [loginError, setLoginError] = useState("");
-
-  const [activeTab, setActiveTab] = useState<AppTab>("calculator");
-  const [hasHydrated, setHasHydrated] = useState(false);
 
   const [mapsReady, setMapsReady] = useState(false);
   const [needsApiKey, setNeedsApiKey] = useState(false);
@@ -313,16 +412,23 @@ export default function Home() {
   const [cashConcept, setCashConcept] = useState("");
   const [cashAmount, setCashAmount] = useState(0);
   const [cashKind, setCashKind] = useState<CashEntryKind>("income");
+  const [cashBox, setCashBox] = useState<CashBox>("cash");
+  const [incomeReason, setIncomeReason] = useState<IncomeReason>("manual");
+  const [expenseReason, setExpenseReason] = useState<ExpenseReason>("manual");
+  const [cashClientId, setCashClientId] = useState(DEFAULT_CLIENTS[0].id);
+  const [cashDriverId, setCashDriverId] = useState(DEFAULT_DRIVERS[0].id);
 
   const [newUserName, setNewUserName] = useState("");
   const [newUsername, setNewUsername] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [newUserDashboard, setNewUserDashboard] = useState(false);
+  const [newUserAccounts, setNewUserAccounts] = useState(false);
   const [newUserCash, setNewUserCash] = useState(false);
   const [newUserSettings, setNewUserSettings] = useState(false);
   const [newUserAudits, setNewUserAudits] = useState(false);
 
   const [newDriverName, setNewDriverName] = useState("");
+  const [newDriverRatePercent, setNewDriverRatePercent] = useState(65);
   const [newClientName, setNewClientName] = useState("");
 
   const mapRef = useRef<HTMLDivElement | null>(null);
@@ -339,9 +445,19 @@ export default function Home() {
   );
 
   const canDashboard = currentUser?.permissions.dashboard ?? false;
+  const canAccounts = currentUser?.permissions.accounts ?? false;
   const canCash = currentUser?.permissions.cash ?? false;
   const canSettings = currentUser?.permissions.settings ?? false;
   const canAudits = currentUser?.permissions.audits ?? false;
+
+  const selectedDriver = useMemo(
+    () => drivers.find((driver) => driver.id === selectedDriverId) ?? null,
+    [drivers, selectedDriverId]
+  );
+  const selectedClient = useMemo(
+    () => clients.find((client) => client.id === selectedClientId) ?? null,
+    [clients, selectedClientId]
+  );
 
   const quote = useMemo(() => {
     const distanceKm = routeSummary?.distanceKm ?? Math.max(0, manualKm);
@@ -349,65 +465,82 @@ export default function Home() {
     const subtotal = Math.max(config.minimumFare, distancePrice);
     const peakSurcharge = timeMode === "peak" ? subtotal * (config.peakMultiplier - 1) : 0;
     const afterPeak = subtotal + peakSurcharge;
-    const hotelSurcharge = hotelTrip ? afterPeak * config.hotelSurcharge : 0;
+    const hotelFee = hotelTrip ? afterPeak * config.hotelSurcharge : 0;
     const tolls = includeTolls ? Math.max(0, manualTolls) + config.defaultTolls : 0;
     const waitCharge = Math.max(0, waitValue);
-    const cashTransferTotal = afterPeak + hotelSurcharge + tolls + waitCharge;
-    const cardSurcharge = cashTransferTotal * config.cardSurcharge;
-    const cardTotal = cashTransferTotal + cardSurcharge;
+    const baseTotal = afterPeak + hotelFee + tolls + waitCharge;
+    const cardSurcharge = baseTotal * config.cardSurcharge;
+    const cardTotal = baseTotal + cardSurcharge;
+    const selectedTotal = getPaymentUsesCardSurcharge(paymentMode) ? cardTotal : baseTotal;
 
     return {
       distanceKm,
       distancePrice,
       subtotal,
       peakSurcharge,
-      hotelSurcharge,
+      hotelFee,
       tolls,
       waitCharge,
-      minimumApplied: distancePrice < config.minimumFare ? config.minimumFare : 0,
-      cashTransferTotal,
+      baseTotal,
       cardSurcharge,
-      cardTotal
+      cardTotal,
+      selectedTotal,
+      minimumApplied: distancePrice < config.minimumFare ? config.minimumFare : 0
     };
-  }, [config, hotelTrip, includeTolls, manualKm, manualTolls, routeSummary, timeMode, waitValue]);
+  }, [
+    config,
+    hotelTrip,
+    includeTolls,
+    manualKm,
+    manualTolls,
+    paymentMode,
+    routeSummary,
+    timeMode,
+    waitValue
+  ]);
 
-  const selectedTotal = paymentMode === "card" ? quote.cardTotal : quote.cashTransferTotal;
-  const totalIncome = cashEntries.filter((item) => item.kind === "income").reduce((sum, item) => sum + item.amount, 0);
-  const totalExpense = cashEntries.filter((item) => item.kind === "expense").reduce((sum, item) => sum + item.amount, 0);
+  const clientBalances = useMemo(() => {
+    const amounts = new Map<string, number>();
+    clients.forEach((client) => amounts.set(client.id, 0));
+    clientLedger.forEach((entry) => {
+      amounts.set(entry.clientId, (amounts.get(entry.clientId) || 0) + entry.amount);
+    });
+    return clients.map((client) => ({
+      ...client,
+      balance: amounts.get(client.id) || 0
+    }));
+  }, [clientLedger, clients]);
+
+  const driverBalances = useMemo(() => {
+    const amounts = new Map<string, number>();
+    drivers.forEach((driver) => amounts.set(driver.id, 0));
+    driverLedger.forEach((entry) => {
+      amounts.set(entry.driverId, (amounts.get(entry.driverId) || 0) + entry.amount);
+    });
+    return drivers.map((driver) => ({
+      ...driver,
+      balance: amounts.get(driver.id) || 0
+    }));
+  }, [driverLedger, drivers]);
+
+  const totalIncome = cashEntries.filter((entry) => entry.kind === "income").reduce((sum, entry) => sum + entry.amount, 0);
+  const totalExpense = cashEntries.filter((entry) => entry.kind === "expense").reduce((sum, entry) => sum + entry.amount, 0);
   const cashBalance = totalIncome - totalExpense;
-  const billedTotal = trips.reduce((sum, item) => sum + item.amount, 0);
+  const boxBalances = useMemo(() => {
+    const balances: Record<CashBox, number> = {
+      cash: 0,
+      mercado_pago: 0,
+      galicia_paul: 0
+    };
 
-  const driverStats = useMemo(() => {
-    return drivers
-      .map((driver) => {
-        const filtered = trips.filter((trip) => trip.driverId === driver.id);
-        const amount = filtered.reduce((sum, trip) => sum + trip.amount, 0);
-        return {
-          id: driver.id,
-          name: driver.name,
-          trips: filtered.length,
-          amount
-        };
-      })
-      .filter((item) => item.trips > 0)
-      .sort((a, b) => b.amount - a.amount);
-  }, [drivers, trips]);
+    cashEntries.forEach((entry) => {
+      const sign = entry.kind === "income" ? 1 : -1;
+      balances[entry.box] += sign * entry.amount;
+    });
 
-  const clientStats = useMemo(() => {
-    return clients
-      .map((client) => {
-        const filtered = trips.filter((trip) => trip.clientId === client.id);
-        const amount = filtered.reduce((sum, trip) => sum + trip.amount, 0);
-        return {
-          id: client.id,
-          name: client.name,
-          trips: filtered.length,
-          amount
-        };
-      })
-      .filter((item) => item.trips > 0)
-      .sort((a, b) => b.amount - a.amount);
-  }, [clients, trips]);
+    return balances;
+  }, [cashEntries]);
+  const totalBilled = confirmedTrips.reduce((sum, trip) => sum + trip.totalAmount, 0);
 
   function readStorage<T>(key: string, fallback: T): T {
     try {
@@ -430,8 +563,40 @@ export default function Home() {
       userName: actorName || currentUser?.name || "Sistema",
       action
     };
+    setAudits((current) => [entry, ...current].slice(0, 600));
+  }
 
-    setAudits((current) => [entry, ...current].slice(0, 500));
+  function addClientLedgerEntry(entry: Omit<ClientLedgerEntry, "id" | "createdAt">) {
+    setClientLedger((current) => [
+      {
+        id: makeId("client-ledger"),
+        createdAt: new Date().toISOString(),
+        ...entry
+      },
+      ...current
+    ]);
+  }
+
+  function addDriverLedgerEntry(entry: Omit<DriverLedgerEntry, "id" | "createdAt">) {
+    setDriverLedger((current) => [
+      {
+        id: makeId("driver-ledger"),
+        createdAt: new Date().toISOString(),
+        ...entry
+      },
+      ...current
+    ]);
+  }
+
+  function addCashEntry(entry: Omit<CashEntry, "id" | "createdAt">) {
+    setCashEntries((current) => [
+      {
+        id: makeId("cash"),
+        createdAt: new Date().toISOString(),
+        ...entry
+      },
+      ...current
+    ]);
   }
 
   useEffect(() => {
@@ -439,17 +604,23 @@ export default function Home() {
     const savedUsers = readStorage<AppUser[]>(STORAGE_KEYS.users, DEFAULT_USERS);
     const savedDrivers = readStorage<Driver[]>(STORAGE_KEYS.drivers, DEFAULT_DRIVERS);
     const savedClients = readStorage<CorporateClient[]>(STORAGE_KEYS.clients, DEFAULT_CLIENTS);
-    const savedTrips = readStorage<TripRecord[]>(STORAGE_KEYS.trips, []);
-    const savedAudits = readStorage<AuditEntry[]>(STORAGE_KEYS.audits, []);
+    const savedPendingTrips = readStorage<PendingTrip[]>(STORAGE_KEYS.pendingTrips, []);
+    const savedConfirmedTrips = readStorage<ConfirmedTrip[]>(STORAGE_KEYS.confirmedTrips, []);
+    const savedClientLedger = readStorage<ClientLedgerEntry[]>(STORAGE_KEYS.clientLedger, []);
+    const savedDriverLedger = readStorage<DriverLedgerEntry[]>(STORAGE_KEYS.driverLedger, []);
     const savedCash = readStorage<CashEntry[]>(STORAGE_KEYS.cash, []);
+    const savedAudits = readStorage<AuditEntry[]>(STORAGE_KEYS.audits, []);
 
     setConfig(mergeConfig(savedConfig));
-    setUsers(savedUsers.length ? savedUsers : DEFAULT_USERS);
-    setDrivers(savedDrivers.length ? savedDrivers : DEFAULT_DRIVERS);
+    setUsers(normalizeUsers(savedUsers.length ? savedUsers : DEFAULT_USERS));
+    setDrivers(normalizeDrivers(savedDrivers.length ? savedDrivers : DEFAULT_DRIVERS));
     setClients(savedClients.length ? savedClients : DEFAULT_CLIENTS);
-    setTrips(savedTrips);
+    setPendingTrips(savedPendingTrips);
+    setConfirmedTrips(savedConfirmedTrips);
+    setClientLedger(savedClientLedger);
+    setDriverLedger(savedDriverLedger);
+    setCashEntries(normalizeCashEntries(savedCash));
     setAudits(savedAudits);
-    setCashEntries(savedCash);
 
     const envApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY?.trim();
     const storedApiKey = window.localStorage.getItem(STORAGE_KEYS.maps)?.trim();
@@ -489,13 +660,23 @@ export default function Home() {
 
   useEffect(() => {
     if (!hasHydrated) return;
-    writeStorage(STORAGE_KEYS.trips, trips);
-  }, [hasHydrated, trips]);
+    writeStorage(STORAGE_KEYS.pendingTrips, pendingTrips);
+  }, [hasHydrated, pendingTrips]);
 
   useEffect(() => {
     if (!hasHydrated) return;
-    writeStorage(STORAGE_KEYS.audits, audits);
-  }, [audits, hasHydrated]);
+    writeStorage(STORAGE_KEYS.confirmedTrips, confirmedTrips);
+  }, [confirmedTrips, hasHydrated]);
+
+  useEffect(() => {
+    if (!hasHydrated) return;
+    writeStorage(STORAGE_KEYS.clientLedger, clientLedger);
+  }, [clientLedger, hasHydrated]);
+
+  useEffect(() => {
+    if (!hasHydrated) return;
+    writeStorage(STORAGE_KEYS.driverLedger, driverLedger);
+  }, [driverLedger, hasHydrated]);
 
   useEffect(() => {
     if (!hasHydrated) return;
@@ -503,16 +684,39 @@ export default function Home() {
   }, [cashEntries, hasHydrated]);
 
   useEffect(() => {
+    if (!hasHydrated) return;
+    writeStorage(STORAGE_KEYS.audits, audits);
+  }, [audits, hasHydrated]);
+
+  useEffect(() => {
     if (!drivers.length) return;
-    if (drivers.some((item) => item.id === selectedDriverId)) return;
+    if (drivers.some((driver) => driver.id === selectedDriverId)) return;
     setSelectedDriverId(drivers[0].id);
   }, [drivers, selectedDriverId]);
 
   useEffect(() => {
     if (!clients.length) return;
-    if (clients.some((item) => item.id === selectedClientId)) return;
+    if (clients.some((client) => client.id === selectedClientId)) return;
     setSelectedClientId(clients[0].id);
   }, [clients, selectedClientId]);
+
+  useEffect(() => {
+    if (!drivers.length) return;
+    if (drivers.some((driver) => driver.id === cashDriverId)) return;
+    setCashDriverId(drivers[0].id);
+  }, [cashDriverId, drivers]);
+
+  useEffect(() => {
+    if (!clients.length) return;
+    if (clients.some((client) => client.id === cashClientId)) return;
+    setCashClientId(clients[0].id);
+  }, [cashClientId, clients]);
+
+  useEffect(() => {
+    if (!clients.length) return;
+    if (clients.some((client) => client.id === config.hotelClientId)) return;
+    setConfig((current) => ({ ...current, hotelClientId: clients[0].id }));
+  }, [clients, config.hotelClientId]);
 
   useEffect(() => {
     if (!currentUser) return;
@@ -520,23 +724,21 @@ export default function Home() {
       setNeedsApiKey(true);
       return;
     }
-
     loadGoogleMaps(activeApiKey);
   }, [activeApiKey, currentUser]);
 
   useEffect(() => {
     if (!currentUser) return;
 
-    const allowedTabs: AppTab[] = ["calculator"];
+    const allowedTabs: AppTab[] = ["calculator", "pending"];
     if (canDashboard) allowedTabs.push("dashboard");
+    if (canAccounts) allowedTabs.push("accounts");
     if (canCash) allowedTabs.push("cash");
     if (canSettings) allowedTabs.push("settings");
     if (canAudits) allowedTabs.push("audits");
 
-    if (!allowedTabs.includes(activeTab)) {
-      setActiveTab("calculator");
-    }
-  }, [activeTab, canAudits, canCash, canDashboard, canSettings, currentUser]);
+    if (!allowedTabs.includes(activeTab)) setActiveTab("calculator");
+  }, [activeTab, canAccounts, canAudits, canCash, canDashboard, canSettings, currentUser]);
 
   function loadGoogleMaps(apiKey: string) {
     const initMaps = () => {
@@ -613,7 +815,6 @@ export default function Home() {
 
     window.localStorage.setItem(STORAGE_KEYS.maps, key);
     setActiveApiKey(key);
-    setNeedsApiKey(false);
     setMessage("Cargando Google Maps...");
     setMessageType("default");
     registerAudit("Google Maps API key actualizada.");
@@ -622,15 +823,12 @@ export default function Home() {
   function collectAddressValues() {
     return {
       origin: originRef.current?.value.trim() || "",
-      stop1: stop1Ref.current?.value.trim() || "",
-      stop2: stop2Ref.current?.value.trim() || "",
       destination: destinationRef.current?.value.trim() || ""
     };
   }
 
   async function handleCalculateRoute(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-
     const { origin, destination } = collectAddressValues();
 
     if (!mapsReady) {
@@ -667,7 +865,7 @@ export default function Home() {
           : "Ruta calculada correctamente."
       );
       setMessageType("success");
-      registerAudit("Calculadora: ruta calculada con Google Maps.");
+      registerAudit("Calculadora: ruta calculada.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "No se pudo calcular la ruta.");
       setMessageType("error");
@@ -686,8 +884,8 @@ export default function Home() {
     }
 
     const waypoints = [stop1Ref.current?.value.trim(), stop2Ref.current?.value.trim()]
-      .filter((item): item is string => Boolean(item))
-      .map((item) => ({ location: item, stopover: true }));
+      .filter((value): value is string => Boolean(value))
+      .map((value) => ({ location: value, stopover: true }));
 
     return new Promise<RouteSummary>((resolve, reject) => {
       directionsService.route(
@@ -730,11 +928,8 @@ export default function Home() {
     });
   }
 
-  function handleSaveTrip() {
-    const driver = drivers.find((item) => item.id === selectedDriverId);
-    const client = clients.find((item) => item.id === selectedClientId);
-
-    if (!driver || !client) {
+  function handleQueueTrip() {
+    if (!selectedDriver || !selectedClient) {
       setMessage("Selecciona chofer y cliente validos.");
       setMessageType("error");
       return;
@@ -742,37 +937,142 @@ export default function Home() {
 
     const { origin, destination } = collectAddressValues();
     if (origin.length < 3 || destination.length < 3) {
-      setMessage("Para guardar el viaje, completa origen y destino.");
+      setMessage("Para cargar el viaje debes completar origen y destino.");
       setMessageType("error");
       return;
     }
 
-    const entry: TripRecord = {
-      id: makeId("trip"),
+    const trip: PendingTrip = {
+      id: makeId("pending-trip"),
       createdAt: new Date().toISOString(),
-      driverId: driver.id,
-      driverName: driver.name,
-      clientId: client.id,
-      clientName: client.name,
+      driverId: selectedDriver.id,
+      driverName: selectedDriver.name,
+      clientId: selectedClient.id,
+      clientName: selectedClient.name,
       origin,
       destination,
       kilometers: Number(quote.distanceKm.toFixed(2)),
-      durationSeconds: routeSummary?.durationSeconds ?? 0,
+      durationSeconds: routeSummary?.durationSeconds || 0,
       paymentMode,
-      amount: Math.round(selectedTotal),
-      notes: routeSummary ? "Ruta real por Google Maps" : "Km manual"
+      timeMode,
+      hotelTrip,
+      waitCharge: Math.round(quote.waitCharge),
+      tolls: Math.round(quote.tolls),
+      baseTotal: Math.round(quote.baseTotal),
+      cardSurcharge: Math.round(quote.cardSurcharge),
+      hotelFee: Math.round(quote.hotelFee),
+      totalAmount: Math.round(quote.selectedTotal),
+      notes: routeSummary ? "Ruta real calculada" : "Viaje cargado con km manual"
     };
 
-    setTrips((current) => [entry, ...current]);
-    setMessage("Viaje guardado correctamente.");
+    setPendingTrips((current) => [trip, ...current]);
+    setMessage("Viaje cargado en pendientes.");
     setMessageType("success");
-    registerAudit(`Viaje guardado para ${driver.name} - ${client.name}.`);
+    registerAudit(`Viaje cargado en pendientes para ${trip.driverName} - ${trip.clientName}.`);
+  }
+
+  function applyTripAccounting(trip: PendingTrip) {
+    const driver = drivers.find((item) => item.id === trip.driverId);
+    const driverRate = driver?.commissionRate ?? 0;
+    const driverCommission = Math.round(trip.totalAmount * driverRate);
+
+    if (driverCommission > 0) {
+      addDriverLedgerEntry({
+        driverId: trip.driverId,
+        driverName: trip.driverName,
+        amount: driverCommission,
+        concept: `Comision viaje confirmado ${trip.id}`,
+        source: "trip_commission"
+      });
+    }
+
+    if (trip.paymentMode === "pending" || trip.paymentMode === "advance") {
+      addClientLedgerEntry({
+        clientId: trip.clientId,
+        clientName: trip.clientName,
+        amount: -Math.round(trip.totalAmount),
+        concept:
+          trip.paymentMode === "pending"
+            ? `Viaje pendiente de pago ${trip.id}`
+            : `Consumo de saldo adelantado ${trip.id}`,
+        source: "trip"
+      });
+    }
+
+    if (trip.paymentMode === "cash") {
+      addCashEntry({
+        concept: `Cobro viaje confirmado ${trip.id}`,
+        amount: Math.round(trip.totalAmount),
+        kind: "income",
+        reason: "trip_payment",
+        box: "cash",
+        linkedName: `${trip.clientName} / ${trip.driverName}`
+      });
+    }
+
+    if (trip.paymentMode === "transfer") {
+      addCashEntry({
+        concept: `Cobro transferencia viaje ${trip.id}`,
+        amount: Math.round(trip.totalAmount),
+        kind: "income",
+        reason: "trip_payment",
+        box: "galicia_paul",
+        linkedName: `${trip.clientName} / ${trip.driverName}`
+      });
+    }
+
+    if (trip.paymentMode === "card" || trip.paymentMode === "posnet") {
+      const netMercadoPago = Math.round(trip.totalAmount * (1 - MERCADO_PAGO_DISCOUNT_RATE));
+      addCashEntry({
+        concept: `Cobro ${trip.paymentMode === "card" ? "tarjeta" : "posnet"} viaje ${trip.id} (-12%)`,
+        amount: netMercadoPago,
+        kind: "income",
+        reason: "trip_payment",
+        box: "mercado_pago",
+        linkedName: `${trip.clientName} / ${trip.driverName}`
+      });
+    }
+
+    if (trip.hotelTrip && trip.hotelFee > 0) {
+      const hotelClient = clients.find((item) => item.id === config.hotelClientId);
+      if (hotelClient) {
+        addClientLedgerEntry({
+          clientId: hotelClient.id,
+          clientName: hotelClient.name,
+          amount: Math.round(trip.hotelFee),
+          concept: `Comision hotel viaje ${trip.id}`,
+          source: "hotel"
+        });
+      }
+    }
+  }
+
+  function confirmPendingTrip(tripId: string) {
+    const trip = pendingTrips.find((item) => item.id === tripId);
+    if (!trip) return;
+
+    setPendingTrips((current) => current.filter((item) => item.id !== tripId));
+    setConfirmedTrips((current) => [
+      {
+        ...trip,
+        confirmedAt: new Date().toISOString()
+      },
+      ...current
+    ]);
+
+    applyTripAccounting(trip);
+    registerAudit(`Viaje confirmado ${trip.id}.`);
+  }
+
+  function declinePendingTrip(tripId: string) {
+    const trip = pendingTrips.find((item) => item.id === tripId);
+    setPendingTrips((current) => current.filter((item) => item.id !== tripId));
+    registerAudit(`Viaje declinado ${trip?.id || tripId}.`);
   }
 
   function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setLoginError("");
-
     const username = normalizeUsername(loginUsername);
     const user = users.find((item) => normalizeUsername(item.username) === username);
 
@@ -796,25 +1096,23 @@ export default function Home() {
 
   function updatePermission(userId: string, key: keyof PermissionSet, value: boolean) {
     setUsers((current) =>
-      current.map((item) =>
-        item.id === userId
+      current.map((user) =>
+        user.id === userId
           ? {
-              ...item,
+              ...user,
               permissions: {
-                ...item.permissions,
+                ...user.permissions,
                 [key]: value
               }
             }
-          : item
+          : user
       )
     );
-
     registerAudit(`Permiso ${key} ${value ? "habilitado" : "bloqueado"} para ${userId}.`);
   }
 
   function handleAddUser(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-
     const name = normalizeName(newUserName);
     const username = normalizeUsername(newUsername);
     const password = newPassword.trim();
@@ -828,7 +1126,6 @@ export default function Home() {
     if (users.some((item) => normalizeUsername(item.username) === username)) {
       setMessage("Ese usuario ya existe.");
       setMessageType("error");
-      registerAudit(`Intento de alta de usuario duplicado: ${username}.`);
       return;
     }
 
@@ -839,6 +1136,7 @@ export default function Home() {
       password,
       permissions: {
         dashboard: newUserDashboard,
+        accounts: newUserAccounts,
         cash: newUserCash,
         settings: newUserSettings,
         audits: newUserAudits
@@ -850,50 +1148,54 @@ export default function Home() {
     setNewUsername("");
     setNewPassword("");
     setNewUserDashboard(false);
+    setNewUserAccounts(false);
     setNewUserCash(false);
     setNewUserSettings(false);
     setNewUserAudits(false);
-    registerAudit(`Usuario creado: ${username}.`);
-    setMessage("Usuario creado correctamente.");
+    setMessage("Usuario creado.");
     setMessageType("success");
+    registerAudit(`Usuario creado: ${username}.`);
   }
 
   function handleAddDriver(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const name = normalizeName(newDriverName);
+    const rate = Math.min(100, Math.max(0, Number(newDriverRatePercent) || 0));
 
     if (!name) return;
-    if (drivers.some((item) => item.name.toLowerCase() === name.toLowerCase())) {
+    if (drivers.some((driver) => driver.name.toLowerCase() === name.toLowerCase())) {
       setMessage("Ese chofer ya existe.");
       setMessageType("error");
       return;
     }
 
-    const newDriver: Driver = { id: makeId("driver"), name };
+    const newDriver: Driver = {
+      id: makeId("driver"),
+      name,
+      commissionRate: rate / 100
+    };
+
     setDrivers((current) => [...current, newDriver]);
     setNewDriverName("");
+    setNewDriverRatePercent(65);
     setMessage("Chofer agregado.");
     setMessageType("success");
-    registerAudit(`Chofer agregado: ${name}.`);
+    registerAudit(`Chofer agregado: ${name} (${rate}%).`);
   }
 
-  function handleAddClient(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const name = normalizeName(newClientName);
-
-    if (!name) return;
-    if (clients.some((item) => item.name.toLowerCase() === name.toLowerCase())) {
-      setMessage("Ese cliente ya existe.");
-      setMessageType("error");
-      return;
-    }
-
-    const newClient: CorporateClient = { id: makeId("client"), name };
-    setClients((current) => [...current, newClient]);
-    setNewClientName("");
-    setMessage("Cliente agregado.");
-    setMessageType("success");
-    registerAudit(`Cliente agregado: ${name}.`);
+  function updateDriverRate(driverId: string, ratePercent: number) {
+    const safePercent = Math.min(100, Math.max(0, ratePercent));
+    setDrivers((current) =>
+      current.map((driver) =>
+        driver.id === driverId
+          ? {
+              ...driver,
+              commissionRate: safePercent / 100
+            }
+          : driver
+      )
+    );
+    registerAudit(`Comision de chofer actualizada (${driverId}) a ${safePercent}%.`);
   }
 
   function removeDriver(driverId: string) {
@@ -902,16 +1204,37 @@ export default function Home() {
       setMessageType("error");
       return;
     }
+    if (pendingTrips.some((trip) => trip.driverId === driverId) || confirmedTrips.some((trip) => trip.driverId === driverId)) {
+      setMessage("No puedes eliminar un chofer con viajes asociados.");
+      setMessageType("error");
+      return;
+    }
+    const deleted = drivers.find((driver) => driver.id === driverId);
+    setDrivers((current) => current.filter((driver) => driver.id !== driverId));
+    registerAudit(`Chofer eliminado: ${deleted?.name || driverId}.`);
+  }
 
-    if (trips.some((trip) => trip.driverId === driverId)) {
-      setMessage("No puedes borrar un chofer con viajes registrados.");
+  function handleAddClient(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const name = normalizeName(newClientName);
+    if (!name) return;
+
+    if (clients.some((client) => client.name.toLowerCase() === name.toLowerCase())) {
+      setMessage("Ese cliente ya existe.");
       setMessageType("error");
       return;
     }
 
-    const removed = drivers.find((item) => item.id === driverId);
-    setDrivers((current) => current.filter((item) => item.id !== driverId));
-    registerAudit(`Chofer eliminado: ${removed?.name || driverId}.`);
+    const newClient: CorporateClient = {
+      id: makeId("client"),
+      name
+    };
+
+    setClients((current) => [...current, newClient]);
+    setNewClientName("");
+    setMessage("Cliente agregado.");
+    setMessageType("success");
+    registerAudit(`Cliente agregado: ${name}.`);
   }
 
   function removeClient(clientId: string) {
@@ -921,15 +1244,24 @@ export default function Home() {
       return;
     }
 
-    if (trips.some((trip) => trip.clientId === clientId)) {
-      setMessage("No puedes borrar un cliente con viajes registrados.");
+    const hasTrips =
+      pendingTrips.some((trip) => trip.clientId === clientId) || confirmedTrips.some((trip) => trip.clientId === clientId);
+    if (hasTrips) {
+      setMessage("No puedes eliminar un cliente con viajes asociados.");
       setMessageType("error");
       return;
     }
 
-    const removed = clients.find((item) => item.id === clientId);
-    setClients((current) => current.filter((item) => item.id !== clientId));
-    registerAudit(`Cliente eliminado: ${removed?.name || clientId}.`);
+    const hasMovements = clientLedger.some((entry) => entry.clientId === clientId);
+    if (hasMovements) {
+      setMessage("No puedes eliminar un cliente con movimientos de cuenta.");
+      setMessageType("error");
+      return;
+    }
+
+    const deleted = clients.find((client) => client.id === clientId);
+    setClients((current) => current.filter((client) => client.id !== clientId));
+    registerAudit(`Cliente eliminado: ${deleted?.name || clientId}.`);
   }
 
   function handleAddCash(event: FormEvent<HTMLFormElement>) {
@@ -937,26 +1269,71 @@ export default function Home() {
     const concept = normalizeName(cashConcept);
     const amount = Math.round(cashAmount);
 
-    if (!concept || amount <= 0) return;
+    if (!concept || amount <= 0) {
+      setMessage("Completa concepto y monto.");
+      setMessageType("error");
+      return;
+    }
 
-    const entry: CashEntry = {
-      id: makeId("cash"),
-      createdAt: new Date().toISOString(),
+    let reason: CashEntry["reason"] = "manual";
+    let linkedName: string | undefined;
+
+    if (cashKind === "income") {
+      reason = incomeReason === "pending_payment" ? "pending_payment" : "manual";
+      if (incomeReason === "pending_payment") {
+        const client = clients.find((item) => item.id === cashClientId);
+        if (!client) {
+          setMessage("Selecciona un cliente valido.");
+          setMessageType("error");
+          return;
+        }
+        linkedName = client.name;
+        addClientLedgerEntry({
+          clientId: client.id,
+          clientName: client.name,
+          amount,
+          concept: `Ingreso aplicado a cuenta corriente: ${concept}`,
+          source: "pending_payment"
+        });
+      }
+    } else {
+      reason = expenseReason === "commission_payment" ? "commission_payment" : "manual";
+      if (expenseReason === "commission_payment") {
+        const driver = drivers.find((item) => item.id === cashDriverId);
+        if (!driver) {
+          setMessage("Selecciona un chofer valido.");
+          setMessageType("error");
+          return;
+        }
+        linkedName = driver.name;
+        addDriverLedgerEntry({
+          driverId: driver.id,
+          driverName: driver.name,
+          amount: -amount,
+          concept: `Pago de comisiones: ${concept}`,
+          source: "commission_payment"
+        });
+      }
+    }
+
+    addCashEntry({
       concept,
       amount,
-      kind: cashKind
-    };
-
-    setCashEntries((current) => [entry, ...current]);
+      kind: cashKind,
+      reason,
+      box: cashBox,
+      linkedName
+    });
     setCashConcept("");
     setCashAmount(0);
-    setCashKind("income");
-    registerAudit(`Caja: ${cashKind === "income" ? "ingreso" : "egreso"} ${formatCurrency(amount)}.`);
+    registerAudit(
+      `Caja (${getCashBoxLabel(cashBox)}): ${cashKind === "income" ? "ingreso" : "egreso"} ${formatCurrency(amount)}.`
+    );
   }
 
   function handleConfigSave(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setMessage("Tarifas guardadas.");
+    setMessage("Configuracion guardada.");
     setMessageType("success");
     registerAudit("Configuracion de tarifas actualizada.");
   }
@@ -970,7 +1347,7 @@ export default function Home() {
           </div>
           <div className="login-content">
             <h1>Ingreso al sistema</h1>
-            <p>Accede con tu usuario y contrasena para habilitar tus modulos.</p>
+            <p>Accede con tu usuario y contrasena.</p>
             <form className="login-form" onSubmit={handleLogin}>
               <label>
                 Usuario
@@ -988,11 +1365,6 @@ export default function Home() {
               {loginError ? <p className="error-text">{loginError}</p> : null}
               <button type="submit">Entrar</button>
             </form>
-            <div className="default-users">
-              <strong>Accesos iniciales:</strong>
-              <span>admin / Michofer2026</span>
-              <span>operador / Chofer2026</span>
-            </div>
           </div>
         </section>
       </main>
@@ -1018,26 +1390,34 @@ export default function Home() {
       </header>
 
       <nav className="tabs">
-        <button className={activeTab === "calculator" ? "active" : ""} onClick={() => setActiveTab("calculator")} type="button">
+        <button className={activeTab === "calculator" ? "active" : ""} type="button" onClick={() => setActiveTab("calculator")}>
           Calculadora
         </button>
+        <button className={activeTab === "pending" ? "active" : ""} type="button" onClick={() => setActiveTab("pending")}>
+          Viajes pendientes
+        </button>
         {canDashboard ? (
-          <button className={activeTab === "dashboard" ? "active" : ""} onClick={() => setActiveTab("dashboard")} type="button">
+          <button className={activeTab === "dashboard" ? "active" : ""} type="button" onClick={() => setActiveTab("dashboard")}>
             Dashboard
           </button>
         ) : null}
+        {canAccounts ? (
+          <button className={activeTab === "accounts" ? "active" : ""} type="button" onClick={() => setActiveTab("accounts")}>
+            Cuentas corrientes
+          </button>
+        ) : null}
         {canCash ? (
-          <button className={activeTab === "cash" ? "active" : ""} onClick={() => setActiveTab("cash")} type="button">
+          <button className={activeTab === "cash" ? "active" : ""} type="button" onClick={() => setActiveTab("cash")}>
             Caja
           </button>
         ) : null}
         {canSettings ? (
-          <button className={activeTab === "settings" ? "active" : ""} onClick={() => setActiveTab("settings")} type="button">
+          <button className={activeTab === "settings" ? "active" : ""} type="button" onClick={() => setActiveTab("settings")}>
             Configuracion
           </button>
         ) : null}
         {canAudits ? (
-          <button className={activeTab === "audits" ? "active" : ""} onClick={() => setActiveTab("audits")} type="button">
+          <button className={activeTab === "audits" ? "active" : ""} type="button" onClick={() => setActiveTab("audits")}>
             Auditorias
           </button>
         ) : null}
@@ -1053,7 +1433,7 @@ export default function Home() {
                 <select value={selectedDriverId} onChange={(event) => setSelectedDriverId(event.target.value)}>
                   {drivers.map((driver) => (
                     <option key={driver.id} value={driver.id}>
-                      {driver.name}
+                      {driver.name} ({(driver.commissionRate * 100).toFixed(0)}%)
                     </option>
                   ))}
                 </select>
@@ -1134,24 +1514,21 @@ export default function Home() {
                   <input type="checkbox" checked={hotelTrip} onChange={(event) => setHotelTrip(event.target.checked)} />
                   Viaje de hotel
                 </label>
-                <label>
-                  <input
-                    type="radio"
-                    name="paymentMode"
-                    checked={paymentMode === "cash"}
-                    onChange={() => setPaymentMode("cash")}
-                  />
-                  Cobro efectivo / transferencia
-                </label>
-                <label>
-                  <input
-                    type="radio"
-                    name="paymentMode"
-                    checked={paymentMode === "card"}
-                    onChange={() => setPaymentMode("card")}
-                  />
-                  Cobro tarjeta / posnet
-                </label>
+              </div>
+
+              <div className="payment-grid">
+                {PAYMENT_OPTIONS.map((option) => (
+                  <label key={option.value} className={`payment-option ${paymentMode === option.value ? "active" : ""}`}>
+                    <input
+                      type="radio"
+                      name="paymentMode"
+                      checked={paymentMode === option.value}
+                      onChange={() => setPaymentMode(option.value)}
+                    />
+                    <strong>{option.title}</strong>
+                    <span>{option.subtitle}</span>
+                  </label>
+                ))}
               </div>
 
               <div className={`message ${messageType}`}>{message}</div>
@@ -1176,8 +1553,8 @@ export default function Home() {
               <button type="submit" disabled={loadingRoute}>
                 {loadingRoute ? "Calculando..." : "Calcular ruta y tarifa"}
               </button>
-              <button className="secondary" type="button" onClick={handleSaveTrip}>
-                Guardar viaje
+              <button className="secondary" type="button" onClick={handleQueueTrip}>
+                Cargar viaje en pendientes
               </button>
             </form>
 
@@ -1189,12 +1566,12 @@ export default function Home() {
           <article className="card">
             <h2>Resumen</h2>
             <div className="total primary">
-              <span>Total seleccionado</span>
-              <strong>{formatCurrency(selectedTotal)}</strong>
+              <span>Total segun forma de cobro</span>
+              <strong>{formatCurrency(quote.selectedTotal)}</strong>
             </div>
             <div className="total">
-              <span>Total efectivo / transferencia</span>
-              <strong>{formatCurrency(quote.cashTransferTotal)}</strong>
+              <span>Total efectivo / transferencia / pendiente / adelantado</span>
+              <strong>{formatCurrency(quote.baseTotal)}</strong>
             </div>
             <div className="total">
               <span>Total tarjeta / posnet</span>
@@ -1202,6 +1579,18 @@ export default function Home() {
             </div>
 
             <dl className="summary-list">
+              <div>
+                <dt>Chofer</dt>
+                <dd>{selectedDriver?.name || "-"}</dd>
+              </div>
+              <div>
+                <dt>Cliente</dt>
+                <dd>{selectedClient?.name || "-"}</dd>
+              </div>
+              <div>
+                <dt>Forma de cobro</dt>
+                <dd>{PAYMENT_OPTIONS.find((option) => option.value === paymentMode)?.title || "-"}</dd>
+              </div>
               <div>
                 <dt>Distancia</dt>
                 <dd>{quote.distanceKm.toFixed(1)} km</dd>
@@ -1228,7 +1617,7 @@ export default function Home() {
               </div>
               <div>
                 <dt>Recargo hotel</dt>
-                <dd>{formatCurrency(quote.hotelSurcharge)}</dd>
+                <dd>{formatCurrency(quote.hotelFee)}</dd>
               </div>
               <div>
                 <dt>Peajes</dt>
@@ -1247,30 +1636,71 @@ export default function Home() {
         </section>
       ) : null}
 
+      {activeTab === "pending" ? (
+        <section className="panel">
+          <article className="card">
+            <h2>Viajes pendientes de confirmacion</h2>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Fecha</th>
+                    <th>Chofer</th>
+                    <th>Cliente</th>
+                    <th>Recorrido</th>
+                    <th>Cobro</th>
+                    <th>Total</th>
+                    <th>Acciones</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pendingTrips.map((trip) => (
+                    <tr key={trip.id}>
+                      <td>{new Date(trip.createdAt).toLocaleString("es-AR")}</td>
+                      <td>{trip.driverName}</td>
+                      <td>{trip.clientName}</td>
+                      <td>{trip.origin} -> {trip.destination}</td>
+                      <td>{PAYMENT_OPTIONS.find((option) => option.value === trip.paymentMode)?.title || "-"}</td>
+                      <td>{formatCurrency(trip.totalAmount)}</td>
+                      <td className="action-buttons">
+                        <button type="button" onClick={() => confirmPendingTrip(trip.id)}>Confirmar</button>
+                        <button className="secondary" type="button" onClick={() => declinePendingTrip(trip.id)}>
+                          Declinar
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+      ) : null}
+
       {activeTab === "dashboard" && canDashboard ? (
         <section className="panel">
           <div className="stats-grid">
             <article className="card stat">
-              <h2>Facturacion total</h2>
-              <strong>{formatCurrency(billedTotal)}</strong>
+              <h2>Facturacion confirmada</h2>
+              <strong>{formatCurrency(totalBilled)}</strong>
             </article>
             <article className="card stat">
-              <h2>Viajes registrados</h2>
-              <strong>{trips.length}</strong>
+              <h2>Viajes confirmados</h2>
+              <strong>{confirmedTrips.length}</strong>
             </article>
             <article className="card stat">
-              <h2>Choferes</h2>
-              <strong>{drivers.length}</strong>
+              <h2>Viajes pendientes</h2>
+              <strong>{pendingTrips.length}</strong>
             </article>
             <article className="card stat">
-              <h2>Clientes</h2>
-              <strong>{clients.length}</strong>
+              <h2>Saldo de caja</h2>
+              <strong>{formatCurrency(cashBalance)}</strong>
             </article>
           </div>
 
           <div className="panel grid-two">
             <article className="card">
-              <h2>Ultimos viajes</h2>
+              <h2>Ultimos viajes confirmados</h2>
               <div className="table-wrap">
                 <table>
                   <thead>
@@ -1278,66 +1708,47 @@ export default function Home() {
                       <th>Fecha</th>
                       <th>Chofer</th>
                       <th>Cliente</th>
-                      <th>Km</th>
+                      <th>Cobro</th>
                       <th>Total</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {trips.map((trip) => (
+                    {confirmedTrips.map((trip) => (
                       <tr key={trip.id}>
-                        <td>{new Date(trip.createdAt).toLocaleString("es-AR")}</td>
+                        <td>{new Date(trip.confirmedAt).toLocaleString("es-AR")}</td>
                         <td>{trip.driverName}</td>
                         <td>{trip.clientName}</td>
-                        <td>{trip.kilometers.toFixed(1)}</td>
-                        <td>{formatCurrency(trip.amount)}</td>
+                        <td>{PAYMENT_OPTIONS.find((option) => option.value === trip.paymentMode)?.title || "-"}</td>
+                        <td>{formatCurrency(trip.totalAmount)}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
             </article>
-
             <article className="card">
-              <h2>Rendimiento por chofer</h2>
+              <h2>Resumen por chofer</h2>
               <div className="table-wrap">
                 <table>
                   <thead>
                     <tr>
                       <th>Chofer</th>
                       <th>Viajes</th>
-                      <th>Total</th>
+                      <th>Facturado</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {driverStats.map((item) => (
-                      <tr key={item.id}>
-                        <td>{item.name}</td>
-                        <td>{item.trips}</td>
-                        <td>{formatCurrency(item.amount)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-
-              <h2 style={{ marginTop: "14px" }}>Rendimiento por cliente</h2>
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Cliente</th>
-                      <th>Viajes</th>
-                      <th>Total</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {clientStats.map((item) => (
-                      <tr key={item.id}>
-                        <td>{item.name}</td>
-                        <td>{item.trips}</td>
-                        <td>{formatCurrency(item.amount)}</td>
-                      </tr>
-                    ))}
+                    {drivers.map((driver) => {
+                      const trips = confirmedTrips.filter((trip) => trip.driverId === driver.id);
+                      const amount = trips.reduce((sum, trip) => sum + trip.totalAmount, 0);
+                      return (
+                        <tr key={driver.id}>
+                          <td>{driver.name}</td>
+                          <td>{trips.length}</td>
+                          <td>{formatCurrency(amount)}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1346,11 +1757,133 @@ export default function Home() {
         </section>
       ) : null}
 
+      {activeTab === "accounts" && canAccounts ? (
+        <section className="panel grid-two">
+          <article className="card">
+            <h2>Cuenta corriente de clientes</h2>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Cliente</th>
+                    <th>Saldo</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {clientBalances.map((client) => (
+                    <tr key={client.id}>
+                      <td>{client.name}</td>
+                      <td className={client.balance >= 0 ? "balance-positive" : "balance-negative"}>
+                        {formatCurrency(client.balance)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="help-note">Saldo positivo: a favor del cliente. Saldo negativo: cliente adeuda.</p>
+          </article>
+
+          <article className="card">
+            <h2>Cuenta corriente de choferes</h2>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Chofer</th>
+                    <th>Saldo</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {driverBalances.map((driver) => (
+                    <tr key={driver.id}>
+                      <td>{driver.name}</td>
+                      <td className={driver.balance >= 0 ? "balance-positive" : "balance-negative"}>
+                        {formatCurrency(driver.balance)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="help-note">Saldo positivo: a favor del chofer. Saldo negativo: se pago de mas.</p>
+          </article>
+        </section>
+      ) : null}
+
       {activeTab === "cash" && canCash ? (
         <section className="panel grid-two">
           <article className="card">
             <h2>Registrar movimiento</h2>
             <form className="form-grid" onSubmit={handleAddCash}>
+              <label>
+                Caja destino
+                <select value={cashBox} onChange={(event) => setCashBox(event.target.value as CashBox)}>
+                  {CASH_BOX_OPTIONS.map((box) => (
+                    <option key={box.value} value={box.value}>
+                      {box.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Tipo
+                <select
+                  value={cashKind}
+                  onChange={(event) => {
+                    const value = event.target.value as CashEntryKind;
+                    setCashKind(value);
+                  }}
+                >
+                  <option value="income">Ingreso</option>
+                  <option value="expense">Egreso</option>
+                </select>
+              </label>
+
+              {cashKind === "income" ? (
+                <label>
+                  Motivo de ingreso
+                  <select value={incomeReason} onChange={(event) => setIncomeReason(event.target.value as IncomeReason)}>
+                    <option value="manual">Ingreso manual</option>
+                    <option value="pending_payment">Pago de viajes pendientes</option>
+                  </select>
+                </label>
+              ) : (
+                <label>
+                  Motivo de egreso
+                  <select value={expenseReason} onChange={(event) => setExpenseReason(event.target.value as ExpenseReason)}>
+                    <option value="manual">Egreso manual</option>
+                    <option value="commission_payment">Pago de comisiones</option>
+                  </select>
+                </label>
+              )}
+
+              {cashKind === "income" && incomeReason === "pending_payment" ? (
+                <label>
+                  Cliente
+                  <select value={cashClientId} onChange={(event) => setCashClientId(event.target.value)}>
+                    {clients.map((client) => (
+                      <option key={client.id} value={client.id}>
+                        {client.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+
+              {cashKind === "expense" && expenseReason === "commission_payment" ? (
+                <label>
+                  Chofer
+                  <select value={cashDriverId} onChange={(event) => setCashDriverId(event.target.value)}>
+                    {drivers.map((driver) => (
+                      <option key={driver.id} value={driver.id}>
+                        {driver.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+
               <label>
                 Concepto
                 <input value={cashConcept} onChange={(event) => setCashConcept(event.target.value)} required />
@@ -1366,19 +1899,30 @@ export default function Home() {
                   required
                 />
               </label>
-              <label>
-                Tipo
-                <select value={cashKind} onChange={(event) => setCashKind(event.target.value as CashEntryKind)}>
-                  <option value="income">Ingreso</option>
-                  <option value="expense">Egreso</option>
-                </select>
-              </label>
               <button type="submit">Guardar movimiento</button>
             </form>
+            <p className="help-note">
+              Los viajes confirmados con tarjeta/posnet se acreditan automaticamente en Caja Mercado Pago con descuento
+              del 12%.
+            </p>
           </article>
 
           <article className="card">
             <h2>Resumen de caja</h2>
+            <div className="box-balance-grid">
+              <div className="box-balance-item">
+                <span>Caja efectivo</span>
+                <strong>{formatCurrency(boxBalances.cash)}</strong>
+              </div>
+              <div className="box-balance-item">
+                <span>Caja Mercado Pago</span>
+                <strong>{formatCurrency(boxBalances.mercado_pago)}</strong>
+              </div>
+              <div className="box-balance-item">
+                <span>Caja Tarjeta Galicia Paul</span>
+                <strong>{formatCurrency(boxBalances.galicia_paul)}</strong>
+              </div>
+            </div>
             <dl className="summary-list">
               <div>
                 <dt>Total ingresos</dt>
@@ -1393,23 +1937,29 @@ export default function Home() {
                 <dd>{formatCurrency(cashBalance)}</dd>
               </div>
             </dl>
+
             <div className="table-wrap">
               <table>
                 <thead>
                   <tr>
                     <th>Fecha</th>
+                    <th>Caja</th>
                     <th>Concepto</th>
                     <th>Tipo</th>
                     <th>Monto</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {cashEntries.map((item) => (
-                    <tr key={item.id}>
-                      <td>{new Date(item.createdAt).toLocaleString("es-AR")}</td>
-                      <td>{item.concept}</td>
-                      <td>{item.kind === "income" ? "Ingreso" : "Egreso"}</td>
-                      <td>{formatCurrency(item.amount)}</td>
+                  {cashEntries.map((entry) => (
+                    <tr key={entry.id}>
+                      <td>{new Date(entry.createdAt).toLocaleString("es-AR")}</td>
+                      <td>{getCashBoxLabel(entry.box)}</td>
+                      <td>
+                        {entry.concept}
+                        {entry.linkedName ? ` (${entry.linkedName})` : ""}
+                      </td>
+                      <td>{entry.kind === "income" ? "Ingreso" : "Egreso"}</td>
+                      <td>{formatCurrency(entry.amount)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1422,7 +1972,7 @@ export default function Home() {
       {activeTab === "settings" && canSettings ? (
         <section className="panel grid-two">
           <article className="card">
-            <h2>Tarifas</h2>
+            <h2>Tarifas y configuracion</h2>
             <form className="form-grid" onSubmit={handleConfigSave}>
               <label>
                 Precio minimo
@@ -1432,10 +1982,7 @@ export default function Home() {
                   step="100"
                   value={config.minimumFare}
                   onChange={(event) =>
-                    setConfig((current) => ({
-                      ...current,
-                      minimumFare: Math.max(0, Number(event.target.value) || 0)
-                    }))
+                    setConfig((current) => ({ ...current, minimumFare: Math.max(0, Number(event.target.value) || 0) }))
                   }
                 />
               </label>
@@ -1544,17 +2091,37 @@ export default function Home() {
                   }
                 />
               </label>
-              <button type="submit">Guardar tarifas</button>
+              <label>
+                Cliente para comision hotel
+                <select
+                  value={config.hotelClientId}
+                  onChange={(event) => setConfig((current) => ({ ...current, hotelClientId: event.target.value }))}
+                >
+                  {clients.map((client) => (
+                    <option key={client.id} value={client.id}>
+                      {client.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button type="submit">Guardar configuracion</button>
             </form>
 
             <h2 style={{ marginTop: "14px" }}>Choferes</h2>
             <form className="form-grid" onSubmit={handleAddDriver}>
               <label>
-                Nuevo chofer
+                Nombre del chofer
+                <input value={newDriverName} onChange={(event) => setNewDriverName(event.target.value)} required />
+              </label>
+              <label>
+                Porcentaje del chofer (%)
                 <input
-                  value={newDriverName}
-                  onChange={(event) => setNewDriverName(event.target.value)}
-                  placeholder="Nombre del chofer"
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="0.1"
+                  value={newDriverRatePercent}
+                  onChange={(event) => setNewDriverRatePercent(Math.min(100, Math.max(0, Number(event.target.value) || 0)))}
                   required
                 />
               </label>
@@ -1565,15 +2132,26 @@ export default function Home() {
                 <thead>
                   <tr>
                     <th>Chofer</th>
-                    <th>Accion</th>
+                    <th>Comision</th>
+                    <th>Acciones</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {drivers.map((item) => (
-                    <tr key={item.id}>
-                      <td>{item.name}</td>
+                  {drivers.map((driver) => (
+                    <tr key={driver.id}>
+                      <td>{driver.name}</td>
                       <td>
-                        <button className="secondary" type="button" onClick={() => removeDriver(item.id)}>
+                        <input
+                          type="number"
+                          min="0"
+                          max="100"
+                          step="0.1"
+                          value={Number((driver.commissionRate * 100).toFixed(2))}
+                          onChange={(event) => updateDriverRate(driver.id, Number(event.target.value) || 0)}
+                        />
+                      </td>
+                      <td>
+                        <button className="secondary" type="button" onClick={() => removeDriver(driver.id)}>
                           Eliminar
                         </button>
                       </td>
@@ -1586,13 +2164,8 @@ export default function Home() {
             <h2 style={{ marginTop: "14px" }}>Clientes</h2>
             <form className="form-grid" onSubmit={handleAddClient}>
               <label>
-                Nuevo cliente
-                <input
-                  value={newClientName}
-                  onChange={(event) => setNewClientName(event.target.value)}
-                  placeholder="Nombre del cliente"
-                  required
-                />
+                Nombre del cliente
+                <input value={newClientName} onChange={(event) => setNewClientName(event.target.value)} required />
               </label>
               <button type="submit">Agregar cliente</button>
             </form>
@@ -1605,11 +2178,11 @@ export default function Home() {
                   </tr>
                 </thead>
                 <tbody>
-                  {clients.map((item) => (
-                    <tr key={item.id}>
-                      <td>{item.name}</td>
+                  {clients.map((client) => (
+                    <tr key={client.id}>
+                      <td>{client.name}</td>
                       <td>
-                        <button className="secondary" type="button" onClick={() => removeClient(item.id)}>
+                        <button className="secondary" type="button" onClick={() => removeClient(client.id)}>
                           Eliminar
                         </button>
                       </td>
@@ -1628,41 +2201,49 @@ export default function Home() {
                   <tr>
                     <th>Usuario</th>
                     <th>Dashboard</th>
+                    <th>Cuentas</th>
                     <th>Caja</th>
                     <th>Config</th>
                     <th>Auditorias</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {users.map((item) => (
-                    <tr key={item.id}>
-                      <td>{item.username}</td>
+                  {users.map((user) => (
+                    <tr key={user.id}>
+                      <td>{user.username}</td>
                       <td>
                         <input
                           type="checkbox"
-                          checked={item.permissions.dashboard}
-                          onChange={(event) => updatePermission(item.id, "dashboard", event.target.checked)}
+                          checked={user.permissions.dashboard}
+                          onChange={(event) => updatePermission(user.id, "dashboard", event.target.checked)}
                         />
                       </td>
                       <td>
                         <input
                           type="checkbox"
-                          checked={item.permissions.cash}
-                          onChange={(event) => updatePermission(item.id, "cash", event.target.checked)}
+                          checked={user.permissions.accounts}
+                          onChange={(event) => updatePermission(user.id, "accounts", event.target.checked)}
                         />
                       </td>
                       <td>
                         <input
                           type="checkbox"
-                          checked={item.permissions.settings}
-                          onChange={(event) => updatePermission(item.id, "settings", event.target.checked)}
+                          checked={user.permissions.cash}
+                          onChange={(event) => updatePermission(user.id, "cash", event.target.checked)}
                         />
                       </td>
                       <td>
                         <input
                           type="checkbox"
-                          checked={item.permissions.audits}
-                          onChange={(event) => updatePermission(item.id, "audits", event.target.checked)}
+                          checked={user.permissions.settings}
+                          onChange={(event) => updatePermission(user.id, "settings", event.target.checked)}
+                        />
+                      </td>
+                      <td>
+                        <input
+                          type="checkbox"
+                          checked={user.permissions.audits}
+                          onChange={(event) => updatePermission(user.id, "audits", event.target.checked)}
                         />
                       </td>
                     </tr>
@@ -1689,6 +2270,10 @@ export default function Home() {
                 <label>
                   <input type="checkbox" checked={newUserDashboard} onChange={(event) => setNewUserDashboard(event.target.checked)} />
                   Dashboard
+                </label>
+                <label>
+                  <input type="checkbox" checked={newUserAccounts} onChange={(event) => setNewUserAccounts(event.target.checked)} />
+                  Cuentas
                 </label>
                 <label>
                   <input type="checkbox" checked={newUserCash} onChange={(event) => setNewUserCash(event.target.checked)} />
@@ -1723,11 +2308,11 @@ export default function Home() {
                   </tr>
                 </thead>
                 <tbody>
-                  {audits.map((item) => (
-                    <tr key={item.id}>
-                      <td>{new Date(item.createdAt).toLocaleString("es-AR")}</td>
-                      <td>{item.userName}</td>
-                      <td>{item.action}</td>
+                  {audits.map((entry) => (
+                    <tr key={entry.id}>
+                      <td>{new Date(entry.createdAt).toLocaleString("es-AR")}</td>
+                      <td>{entry.userName}</td>
+                      <td>{entry.action}</td>
                     </tr>
                   ))}
                 </tbody>
