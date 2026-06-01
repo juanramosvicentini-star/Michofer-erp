@@ -1659,7 +1659,7 @@ export default function Home() {
                       <td>{new Date(trip.createdAt).toLocaleString("es-AR")}</td>
                       <td>{trip.driverName}</td>
                       <td>{trip.clientName}</td>
-                      <td>{trip.origin} -> {trip.destination}</td>
+                      <td>{trip.origin} {" -> "} {trip.destination}</td>
                       <td>{PAYMENT_OPTIONS.find((option) => option.value === trip.paymentMode)?.title || "-"}</td>
                       <td>{formatCurrency(trip.totalAmount)}</td>
                       <td className="action-buttons">
