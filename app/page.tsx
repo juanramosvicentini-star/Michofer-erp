@@ -5,7 +5,14 @@ import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type TimeMode = "normal" | "peak";
 type CashEntryKind = "income" | "expense";
-type PaymentMode = "cash" | "uber_cash" | "galicia_paul_bank" | "posnet" | "pending" | "advance";
+type PaymentMode =
+  | "cash"
+  | "uber_cash"
+  | "galicia_paul_bank"
+  | "mercado_pago_transfer"
+  | "posnet"
+  | "pending"
+  | "advance";
 type CashBox = "cash" | "uber_cash" | "mercado_pago" | "galicia_paul";
 type StatusTone = "default" | "success" | "error";
 type IncomeReason = "manual" | "pending_payment";
@@ -186,6 +193,11 @@ const PAYMENT_OPTIONS: Array<{ value: PaymentMode; title: string; subtitle: stri
   { value: "cash", title: "Cobro efectivo", subtitle: "Se acredita en caja efectivo" },
   { value: "uber_cash", title: "Cobro efectivo Uber", subtitle: "Se acredita en caja efectivo Uber" },
   { value: "galicia_paul_bank", title: "Cobro Banco Galicia Paul", subtitle: "Se acredita en caja Banco Galicia Paul" },
+  {
+    value: "mercado_pago_transfer",
+    title: "Cobro transferencia Mercado Pago",
+    subtitle: "Se acredita en Caja Mercado Pago sin descuento"
+  },
   { value: "posnet", title: "Cobro posnet", subtitle: "Se acredita en Mercado Pago con descuento 12%" },
   { value: "pending", title: "Saldo pendiente", subtitle: "Se adeuda en cuenta corriente" },
   { value: "advance", title: "Saldo adelantado", subtitle: "Se descuenta del saldo a favor" }
@@ -1081,6 +1093,17 @@ export default function Home() {
         kind: "income",
         reason: "trip_payment",
         box: "galicia_paul",
+        linkedName: `${trip.clientName} / ${trip.driverName}`
+      });
+    }
+
+    if (trip.paymentMode === "mercado_pago_transfer") {
+      addCashEntry({
+        concept: `Cobro transferencia Mercado Pago viaje ${trip.id}`,
+        amount: Math.round(trip.totalAmount),
+        kind: "income",
+        reason: "trip_payment",
+        box: "mercado_pago",
         linkedName: `${trip.clientName} / ${trip.driverName}`
       });
     }
