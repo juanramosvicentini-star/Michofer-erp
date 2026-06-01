@@ -5,8 +5,8 @@ import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type TimeMode = "normal" | "peak";
 type CashEntryKind = "income" | "expense";
-type PaymentMode = "cash" | "transfer" | "card" | "posnet" | "pending" | "advance";
-type CashBox = "cash" | "mercado_pago" | "galicia_paul";
+type PaymentMode = "cash" | "uber_cash" | "galicia_paul_bank" | "posnet" | "pending" | "advance";
+type CashBox = "cash" | "uber_cash" | "mercado_pago" | "galicia_paul";
 type StatusTone = "default" | "success" | "error";
 type IncomeReason = "manual" | "pending_payment";
 type ExpenseReason = "manual" | "commission_payment";
@@ -183,18 +183,19 @@ const STORAGE_KEYS = {
 const DEFAULT_PUBLIC_GOOGLE_MAPS_API_KEY = "AIzaSyCbcYMbdwfcfrGFPQKs3qwKCNR0o53baJ0";
 
 const PAYMENT_OPTIONS: Array<{ value: PaymentMode; title: string; subtitle: string }> = [
-  { value: "cash", title: "Cobro efectivo", subtitle: "Pago en efectivo" },
-  { value: "transfer", title: "Cobro transferencia", subtitle: "Pago por banco" },
-  { value: "card", title: "Cobro tarjeta", subtitle: "Con recargo de tarjeta" },
-  { value: "posnet", title: "Cobro posnet", subtitle: "Con recargo de tarjeta" },
+  { value: "cash", title: "Cobro efectivo", subtitle: "Se acredita en caja efectivo" },
+  { value: "uber_cash", title: "Cobro efectivo Uber", subtitle: "Se acredita en caja efectivo Uber" },
+  { value: "galicia_paul_bank", title: "Cobro Banco Galicia Paul", subtitle: "Se acredita en caja Banco Galicia Paul" },
+  { value: "posnet", title: "Cobro posnet", subtitle: "Se acredita en Mercado Pago con descuento 12%" },
   { value: "pending", title: "Saldo pendiente", subtitle: "Se adeuda en cuenta corriente" },
   { value: "advance", title: "Saldo adelantado", subtitle: "Se descuenta del saldo a favor" }
 ];
 
 const CASH_BOX_OPTIONS: Array<{ value: CashBox; label: string }> = [
   { value: "cash", label: "Caja efectivo" },
+  { value: "uber_cash", label: "Caja efectivo Uber" },
   { value: "mercado_pago", label: "Caja Mercado Pago" },
-  { value: "galicia_paul", label: "Caja Tarjeta Galicia Paul" }
+  { value: "galicia_paul", label: "Caja Banco Galicia Paul" }
 ];
 
 const MERCADO_PAGO_DISCOUNT_RATE = 0.12;
@@ -266,7 +267,11 @@ function normalizeName(value: string) {
 }
 
 function normalizeUsername(value: string) {
-  return value.trim().toLowerCase();
+  return value.trim().toLowerCase().replace(/\s+/g, "");
+}
+
+function normalizePassword(value: string) {
+  return value.trim();
 }
 
 function formatCurrency(value: number) {
@@ -311,16 +316,22 @@ function mergeConfig(raw: Partial<PricingConfig> | null): PricingConfig {
 }
 
 function normalizeUsers(rawUsers: AppUser[]): AppUser[] {
-  return rawUsers.map((user) => ({
-    ...user,
-    permissions: {
-      dashboard: Boolean(user.permissions?.dashboard),
-      accounts: Boolean((user.permissions as Partial<PermissionSet>)?.accounts),
-      cash: Boolean(user.permissions?.cash),
-      settings: Boolean(user.permissions?.settings),
-      audits: Boolean(user.permissions?.audits)
-    }
-  }));
+  return rawUsers
+    .map((user) => ({
+      ...user,
+      id: user.id || makeId("user"),
+      name: normalizeName(user.name || user.username || "Usuario"),
+      username: normalizeUsername(user.username || ""),
+      password: normalizePassword(user.password || ""),
+      permissions: {
+        dashboard: Boolean(user.permissions?.dashboard),
+        accounts: Boolean((user.permissions as Partial<PermissionSet>)?.accounts),
+        cash: Boolean(user.permissions?.cash),
+        settings: Boolean(user.permissions?.settings),
+        audits: Boolean(user.permissions?.audits)
+      }
+    }))
+    .filter((user) => Boolean(user.username) && Boolean(user.password));
 }
 
 function normalizeDrivers(rawDrivers: Driver[]): Driver[] {
@@ -361,7 +372,7 @@ function getRouteError(status: string) {
 }
 
 function getPaymentUsesCardSurcharge(paymentMode: PaymentMode) {
-  return paymentMode === "card" || paymentMode === "posnet";
+  return paymentMode === "posnet";
 }
 
 function getCashBoxLabel(box: CashBox) {
@@ -401,6 +412,8 @@ export default function Home() {
   const [selectedDriverId, setSelectedDriverId] = useState(DEFAULT_DRIVERS[0].id);
   const [selectedClientId, setSelectedClientId] = useState(DEFAULT_CLIENTS[0].id);
   const [manualKm, setManualKm] = useState(0);
+  const [useManualAmount, setUseManualAmount] = useState(false);
+  const [manualTripAmount, setManualTripAmount] = useState(0);
   const [waitValue, setWaitValue] = useState(0);
   const [manualTolls, setManualTolls] = useState(0);
   const [includeTolls, setIncludeTolls] = useState(true);
@@ -430,6 +443,7 @@ export default function Home() {
   const [newDriverName, setNewDriverName] = useState("");
   const [newDriverRatePercent, setNewDriverRatePercent] = useState(65);
   const [newClientName, setNewClientName] = useState("");
+  const [activeNumberField, setActiveNumberField] = useState<string | null>(null);
 
   const mapRef = useRef<HTMLDivElement | null>(null);
   const originRef = useRef<HTMLInputElement | null>(null);
@@ -471,7 +485,8 @@ export default function Home() {
     const baseTotal = afterPeak + hotelFee + tolls + waitCharge;
     const cardSurcharge = baseTotal * config.cardSurcharge;
     const cardTotal = baseTotal + cardSurcharge;
-    const selectedTotal = getPaymentUsesCardSurcharge(paymentMode) ? cardTotal : baseTotal;
+    const calculatedTotal = getPaymentUsesCardSurcharge(paymentMode) ? cardTotal : baseTotal;
+    const selectedTotal = useManualAmount ? Math.max(0, manualTripAmount) : calculatedTotal;
 
     return {
       distanceKm,
@@ -485,6 +500,7 @@ export default function Home() {
       cardSurcharge,
       cardTotal,
       selectedTotal,
+      calculatedTotal,
       minimumApplied: distancePrice < config.minimumFare ? config.minimumFare : 0
     };
   }, [
@@ -492,10 +508,12 @@ export default function Home() {
     hotelTrip,
     includeTolls,
     manualKm,
+    manualTripAmount,
     manualTolls,
     paymentMode,
     routeSummary,
     timeMode,
+    useManualAmount,
     waitValue
   ]);
 
@@ -529,6 +547,7 @@ export default function Home() {
   const boxBalances = useMemo(() => {
     const balances: Record<CashBox, number> = {
       cash: 0,
+      uber_cash: 0,
       mercado_pago: 0,
       galicia_paul: 0
     };
@@ -554,6 +573,16 @@ export default function Home() {
 
   function writeStorage(key: string, value: unknown) {
     window.localStorage.setItem(key, JSON.stringify(value));
+  }
+
+  function getNumberInputValue(fieldName: string, value: number) {
+    return activeNumberField === fieldName && value === 0 ? "" : value;
+  }
+
+  function parseNumberInput(rawValue: string, fallback = 0) {
+    if (rawValue.trim() === "") return fallback;
+    const parsed = Number(rawValue);
+    return Number.isFinite(parsed) ? parsed : fallback;
   }
 
   function registerAudit(action: string, actorName?: string) {
@@ -777,8 +806,8 @@ export default function Home() {
 
       setMapsReady(true);
       setNeedsApiKey(false);
-      setMessage("Google Maps listo. Ya puedes calcular rutas reales.");
-      setMessageType("success");
+      setMessage("Completa origen y destino para calcular el viaje.");
+      setMessageType("default");
     };
 
     if (window.google?.maps) {
@@ -830,6 +859,20 @@ export default function Home() {
   async function handleCalculateRoute(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const { origin, destination } = collectAddressValues();
+
+    if (useManualAmount) {
+      if (manualTripAmount <= 0) {
+        setMessage("Ingresa un monto manual mayor a 0.");
+        setMessageType("error");
+        return;
+      }
+
+      setRouteSummary(null);
+      setMessage("Monto manual cargado. Puedes enviar el viaje a pendientes.");
+      setMessageType("success");
+      registerAudit("Calculadora: monto manual cargado.");
+      return;
+    }
 
     if (!mapsReady) {
       if (manualKm > 0) {
@@ -942,6 +985,12 @@ export default function Home() {
       return;
     }
 
+    if (useManualAmount && quote.selectedTotal <= 0) {
+      setMessage("Si usas monto manual, ingresa un total mayor a 0.");
+      setMessageType("error");
+      return;
+    }
+
     const trip: PendingTrip = {
       id: makeId("pending-trip"),
       createdAt: new Date().toISOString(),
@@ -958,11 +1007,15 @@ export default function Home() {
       hotelTrip,
       waitCharge: Math.round(quote.waitCharge),
       tolls: Math.round(quote.tolls),
-      baseTotal: Math.round(quote.baseTotal),
-      cardSurcharge: Math.round(quote.cardSurcharge),
-      hotelFee: Math.round(quote.hotelFee),
+      baseTotal: Math.round(useManualAmount ? quote.selectedTotal : quote.baseTotal),
+      cardSurcharge: Math.round(useManualAmount ? 0 : quote.cardSurcharge),
+      hotelFee: Math.round(useManualAmount ? 0 : quote.hotelFee),
       totalAmount: Math.round(quote.selectedTotal),
-      notes: routeSummary ? "Ruta real calculada" : "Viaje cargado con km manual"
+      notes: useManualAmount
+        ? "Viaje cargado con monto manual"
+        : routeSummary
+          ? "Ruta real calculada"
+          : "Viaje cargado con km manual"
     };
 
     setPendingTrips((current) => [trip, ...current]);
@@ -1010,9 +1063,20 @@ export default function Home() {
       });
     }
 
-    if (trip.paymentMode === "transfer") {
+    if (trip.paymentMode === "uber_cash") {
       addCashEntry({
-        concept: `Cobro transferencia viaje ${trip.id}`,
+        concept: `Cobro efectivo Uber viaje ${trip.id}`,
+        amount: Math.round(trip.totalAmount),
+        kind: "income",
+        reason: "trip_payment",
+        box: "uber_cash",
+        linkedName: `${trip.clientName} / ${trip.driverName}`
+      });
+    }
+
+    if (trip.paymentMode === "galicia_paul_bank") {
+      addCashEntry({
+        concept: `Cobro Banco Galicia Paul viaje ${trip.id}`,
         amount: Math.round(trip.totalAmount),
         kind: "income",
         reason: "trip_payment",
@@ -1021,10 +1085,10 @@ export default function Home() {
       });
     }
 
-    if (trip.paymentMode === "card" || trip.paymentMode === "posnet") {
+    if (trip.paymentMode === "posnet") {
       const netMercadoPago = Math.round(trip.totalAmount * (1 - MERCADO_PAGO_DISCOUNT_RATE));
       addCashEntry({
-        concept: `Cobro ${trip.paymentMode === "card" ? "tarjeta" : "posnet"} viaje ${trip.id} (-12%)`,
+        concept: `Cobro posnet viaje ${trip.id} (-12%)`,
         amount: netMercadoPago,
         kind: "income",
         reason: "trip_payment",
@@ -1074,9 +1138,10 @@ export default function Home() {
     event.preventDefault();
     setLoginError("");
     const username = normalizeUsername(loginUsername);
+    const password = normalizePassword(loginPassword);
     const user = users.find((item) => normalizeUsername(item.username) === username);
 
-    if (!user || user.password !== loginPassword) {
+    if (!user || normalizePassword(user.password) !== password) {
       setLoginError("Usuario o contrasena incorrecta.");
       return;
     }
@@ -1115,7 +1180,7 @@ export default function Home() {
     event.preventDefault();
     const name = normalizeName(newUserName);
     const username = normalizeUsername(newUsername);
-    const password = newPassword.trim();
+    const password = normalizePassword(newPassword);
 
     if (!name || !username || !password) {
       setMessage("Completa nombre, usuario y contrasena.");
@@ -1351,7 +1416,14 @@ export default function Home() {
             <form className="login-form" onSubmit={handleLogin}>
               <label>
                 Usuario
-                <input value={loginUsername} onChange={(event) => setLoginUsername(event.target.value)} required />
+                <input
+                  value={loginUsername}
+                  onChange={(event) => setLoginUsername(event.target.value)}
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  autoComplete="username"
+                  required
+                />
               </label>
               <label>
                 Contrasena
@@ -1359,6 +1431,9 @@ export default function Home() {
                   type="password"
                   value={loginPassword}
                   onChange={(event) => setLoginPassword(event.target.value)}
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  autoComplete="current-password"
                   required
                 />
               </label>
@@ -1433,7 +1508,7 @@ export default function Home() {
                 <select value={selectedDriverId} onChange={(event) => setSelectedDriverId(event.target.value)}>
                   {drivers.map((driver) => (
                     <option key={driver.id} value={driver.id}>
-                      {driver.name} ({(driver.commissionRate * 100).toFixed(0)}%)
+                      {driver.name}
                     </option>
                   ))}
                 </select>
@@ -1470,9 +1545,11 @@ export default function Home() {
                   type="number"
                   min="0"
                   step="0.1"
-                  value={manualKm}
+                  value={getNumberInputValue("manualKm", manualKm)}
+                  onFocus={() => setActiveNumberField("manualKm")}
+                  onBlur={() => setActiveNumberField(null)}
                   onChange={(event) => {
-                    setManualKm(Math.max(0, Number(event.target.value) || 0));
+                    setManualKm(Math.max(0, parseNumberInput(event.target.value)));
                     setRouteSummary(null);
                   }}
                 />
@@ -1483,8 +1560,10 @@ export default function Home() {
                   type="number"
                   min="0"
                   step="100"
-                  value={waitValue}
-                  onChange={(event) => setWaitValue(Math.max(0, Number(event.target.value) || 0))}
+                  value={getNumberInputValue("waitValue", waitValue)}
+                  onFocus={() => setActiveNumberField("waitValue")}
+                  onBlur={() => setActiveNumberField(null)}
+                  onChange={(event) => setWaitValue(Math.max(0, parseNumberInput(event.target.value)))}
                 />
               </label>
               <label>
@@ -1493,8 +1572,10 @@ export default function Home() {
                   type="number"
                   min="0"
                   step="100"
-                  value={manualTolls}
-                  onChange={(event) => setManualTolls(Math.max(0, Number(event.target.value) || 0))}
+                  value={getNumberInputValue("manualTolls", manualTolls)}
+                  onFocus={() => setActiveNumberField("manualTolls")}
+                  onBlur={() => setActiveNumberField(null)}
+                  onChange={(event) => setManualTolls(Math.max(0, parseNumberInput(event.target.value)))}
                 />
               </label>
               <label>
@@ -1514,7 +1595,30 @@ export default function Home() {
                   <input type="checkbox" checked={hotelTrip} onChange={(event) => setHotelTrip(event.target.checked)} />
                   Viaje de hotel
                 </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={useManualAmount}
+                    onChange={(event) => setUseManualAmount(event.target.checked)}
+                  />
+                  Monto manual
+                </label>
               </div>
+
+              {useManualAmount ? (
+                <label>
+                  Monto total manual
+                  <input
+                    type="number"
+                    min="0"
+                    step="100"
+                    value={getNumberInputValue("manualTripAmount", manualTripAmount)}
+                    onFocus={() => setActiveNumberField("manualTripAmount")}
+                    onBlur={() => setActiveNumberField(null)}
+                    onChange={(event) => setManualTripAmount(Math.max(0, parseNumberInput(event.target.value)))}
+                  />
+                </label>
+              ) : null}
 
               <div className="payment-grid">
                 {PAYMENT_OPTIONS.map((option) => (
@@ -1570,13 +1674,15 @@ export default function Home() {
               <strong>{formatCurrency(quote.selectedTotal)}</strong>
             </div>
             <div className="total">
-              <span>Total efectivo / transferencia / pendiente / adelantado</span>
-              <strong>{formatCurrency(quote.baseTotal)}</strong>
+              <span>Total calculado por sistema</span>
+              <strong>{formatCurrency(quote.calculatedTotal)}</strong>
             </div>
-            <div className="total">
-              <span>Total tarjeta / posnet</span>
-              <strong>{formatCurrency(quote.cardTotal)}</strong>
-            </div>
+            {useManualAmount ? (
+              <div className="total">
+                <span>Monto manual aplicado</span>
+                <strong>{formatCurrency(quote.selectedTotal)}</strong>
+              </div>
+            ) : null}
 
             <dl className="summary-list">
               <div>
@@ -1590,6 +1696,10 @@ export default function Home() {
               <div>
                 <dt>Forma de cobro</dt>
                 <dd>{PAYMENT_OPTIONS.find((option) => option.value === paymentMode)?.title || "-"}</dd>
+              </div>
+              <div>
+                <dt>Modo de monto</dt>
+                <dd>{useManualAmount ? "Manual" : "Calculado"}</dd>
               </div>
               <div>
                 <dt>Distancia</dt>
@@ -1628,7 +1738,7 @@ export default function Home() {
                 <dd>{formatCurrency(quote.waitCharge)}</dd>
               </div>
               <div>
-                <dt>Recargo tarjeta</dt>
+                <dt>Recargo posnet</dt>
                 <dd>{formatCurrency(quote.cardSurcharge)}</dd>
               </div>
             </dl>
@@ -1894,15 +2004,17 @@ export default function Home() {
                   type="number"
                   min="0"
                   step="100"
-                  value={cashAmount}
-                  onChange={(event) => setCashAmount(Math.max(0, Number(event.target.value) || 0))}
+                  value={getNumberInputValue("cashAmount", cashAmount)}
+                  onFocus={() => setActiveNumberField("cashAmount")}
+                  onBlur={() => setActiveNumberField(null)}
+                  onChange={(event) => setCashAmount(Math.max(0, parseNumberInput(event.target.value)))}
                   required
                 />
               </label>
               <button type="submit">Guardar movimiento</button>
             </form>
             <p className="help-note">
-              Los viajes confirmados con tarjeta/posnet se acreditan automaticamente en Caja Mercado Pago con descuento
+              Los viajes confirmados con posnet se acreditan automaticamente en Caja Mercado Pago con descuento
               del 12%.
             </p>
           </article>
@@ -1915,11 +2027,15 @@ export default function Home() {
                 <strong>{formatCurrency(boxBalances.cash)}</strong>
               </div>
               <div className="box-balance-item">
+                <span>Caja efectivo Uber</span>
+                <strong>{formatCurrency(boxBalances.uber_cash)}</strong>
+              </div>
+              <div className="box-balance-item">
                 <span>Caja Mercado Pago</span>
                 <strong>{formatCurrency(boxBalances.mercado_pago)}</strong>
               </div>
               <div className="box-balance-item">
-                <span>Caja Tarjeta Galicia Paul</span>
+                <span>Caja Banco Galicia Paul</span>
                 <strong>{formatCurrency(boxBalances.galicia_paul)}</strong>
               </div>
             </div>
@@ -1980,9 +2096,14 @@ export default function Home() {
                   type="number"
                   min="0"
                   step="100"
-                  value={config.minimumFare}
+                  value={getNumberInputValue("minimumFare", config.minimumFare)}
+                  onFocus={() => setActiveNumberField("minimumFare")}
+                  onBlur={() => setActiveNumberField(null)}
                   onChange={(event) =>
-                    setConfig((current) => ({ ...current, minimumFare: Math.max(0, Number(event.target.value) || 0) }))
+                    setConfig((current) => ({
+                      ...current,
+                      minimumFare: Math.max(0, parseNumberInput(event.target.value))
+                    }))
                   }
                 />
               </label>
@@ -1992,11 +2113,13 @@ export default function Home() {
                   type="number"
                   min="0"
                   step="50"
-                  value={config.rates.tier1}
+                  value={getNumberInputValue("tier1", config.rates.tier1)}
+                  onFocus={() => setActiveNumberField("tier1")}
+                  onBlur={() => setActiveNumberField(null)}
                   onChange={(event) =>
                     setConfig((current) => ({
                       ...current,
-                      rates: { ...current.rates, tier1: Math.max(0, Number(event.target.value) || 0) }
+                      rates: { ...current.rates, tier1: Math.max(0, parseNumberInput(event.target.value)) }
                     }))
                   }
                 />
@@ -2007,11 +2130,13 @@ export default function Home() {
                   type="number"
                   min="0"
                   step="50"
-                  value={config.rates.tier2}
+                  value={getNumberInputValue("tier2", config.rates.tier2)}
+                  onFocus={() => setActiveNumberField("tier2")}
+                  onBlur={() => setActiveNumberField(null)}
                   onChange={(event) =>
                     setConfig((current) => ({
                       ...current,
-                      rates: { ...current.rates, tier2: Math.max(0, Number(event.target.value) || 0) }
+                      rates: { ...current.rates, tier2: Math.max(0, parseNumberInput(event.target.value)) }
                     }))
                   }
                 />
@@ -2022,11 +2147,13 @@ export default function Home() {
                   type="number"
                   min="0"
                   step="50"
-                  value={config.rates.tier3}
+                  value={getNumberInputValue("tier3", config.rates.tier3)}
+                  onFocus={() => setActiveNumberField("tier3")}
+                  onBlur={() => setActiveNumberField(null)}
                   onChange={(event) =>
                     setConfig((current) => ({
                       ...current,
-                      rates: { ...current.rates, tier3: Math.max(0, Number(event.target.value) || 0) }
+                      rates: { ...current.rates, tier3: Math.max(0, parseNumberInput(event.target.value)) }
                     }))
                   }
                 />
@@ -2037,26 +2164,30 @@ export default function Home() {
                   type="number"
                   min="1"
                   step="0.01"
-                  value={config.peakMultiplier}
+                  value={getNumberInputValue("peakMultiplier", config.peakMultiplier)}
+                  onFocus={() => setActiveNumberField("peakMultiplier")}
+                  onBlur={() => setActiveNumberField(null)}
                   onChange={(event) =>
                     setConfig((current) => ({
                       ...current,
-                      peakMultiplier: Math.max(1, Number(event.target.value) || 1)
+                      peakMultiplier: Math.max(1, parseNumberInput(event.target.value, 1))
                     }))
                   }
                 />
               </label>
               <label>
-                Recargo tarjeta (%)
+                Recargo posnet (%)
                 <input
                   type="number"
                   min="0"
                   step="0.1"
-                  value={Number((config.cardSurcharge * 100).toFixed(2))}
+                  value={getNumberInputValue("cardSurcharge", Number((config.cardSurcharge * 100).toFixed(2)))}
+                  onFocus={() => setActiveNumberField("cardSurcharge")}
+                  onBlur={() => setActiveNumberField(null)}
                   onChange={(event) =>
                     setConfig((current) => ({
                       ...current,
-                      cardSurcharge: Math.max(0, Number(event.target.value) || 0) / 100
+                      cardSurcharge: Math.max(0, parseNumberInput(event.target.value)) / 100
                     }))
                   }
                 />
@@ -2067,11 +2198,13 @@ export default function Home() {
                   type="number"
                   min="0"
                   step="0.1"
-                  value={Number((config.hotelSurcharge * 100).toFixed(2))}
+                  value={getNumberInputValue("hotelSurcharge", Number((config.hotelSurcharge * 100).toFixed(2)))}
+                  onFocus={() => setActiveNumberField("hotelSurcharge")}
+                  onBlur={() => setActiveNumberField(null)}
                   onChange={(event) =>
                     setConfig((current) => ({
                       ...current,
-                      hotelSurcharge: Math.max(0, Number(event.target.value) || 0) / 100
+                      hotelSurcharge: Math.max(0, parseNumberInput(event.target.value)) / 100
                     }))
                   }
                 />
@@ -2082,11 +2215,13 @@ export default function Home() {
                   type="number"
                   min="0"
                   step="100"
-                  value={config.defaultTolls}
+                  value={getNumberInputValue("defaultTolls", config.defaultTolls)}
+                  onFocus={() => setActiveNumberField("defaultTolls")}
+                  onBlur={() => setActiveNumberField(null)}
                   onChange={(event) =>
                     setConfig((current) => ({
                       ...current,
-                      defaultTolls: Math.max(0, Number(event.target.value) || 0)
+                      defaultTolls: Math.max(0, parseNumberInput(event.target.value))
                     }))
                   }
                 />
@@ -2120,8 +2255,12 @@ export default function Home() {
                   min="0"
                   max="100"
                   step="0.1"
-                  value={newDriverRatePercent}
-                  onChange={(event) => setNewDriverRatePercent(Math.min(100, Math.max(0, Number(event.target.value) || 0)))}
+                  value={getNumberInputValue("newDriverRatePercent", newDriverRatePercent)}
+                  onFocus={() => setActiveNumberField("newDriverRatePercent")}
+                  onBlur={() => setActiveNumberField(null)}
+                  onChange={(event) =>
+                    setNewDriverRatePercent(Math.min(100, Math.max(0, parseNumberInput(event.target.value))))
+                  }
                   required
                 />
               </label>
@@ -2146,8 +2285,13 @@ export default function Home() {
                           min="0"
                           max="100"
                           step="0.1"
-                          value={Number((driver.commissionRate * 100).toFixed(2))}
-                          onChange={(event) => updateDriverRate(driver.id, Number(event.target.value) || 0)}
+                          value={getNumberInputValue(
+                            `driverRate-${driver.id}`,
+                            Number((driver.commissionRate * 100).toFixed(2))
+                          )}
+                          onFocus={() => setActiveNumberField(`driverRate-${driver.id}`)}
+                          onBlur={() => setActiveNumberField(null)}
+                          onChange={(event) => updateDriverRate(driver.id, parseNumberInput(event.target.value))}
                         />
                       </td>
                       <td>
@@ -2260,11 +2404,26 @@ export default function Home() {
               </label>
               <label>
                 Usuario
-                <input value={newUsername} onChange={(event) => setNewUsername(event.target.value)} required />
+                <input
+                  value={newUsername}
+                  onChange={(event) => setNewUsername(event.target.value)}
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  autoComplete="username"
+                  required
+                />
               </label>
               <label>
                 Contrasena
-                <input value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required />
+                <input
+                  type="password"
+                  value={newPassword}
+                  onChange={(event) => setNewPassword(event.target.value)}
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  autoComplete="new-password"
+                  required
+                />
               </label>
               <div className="inline-options">
                 <label>
