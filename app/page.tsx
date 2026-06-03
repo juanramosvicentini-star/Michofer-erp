@@ -481,6 +481,44 @@ function getCashBoxLabel(box: CashBox) {
   return CASH_BOX_OPTIONS.find((item) => item.value === box)?.label || box;
 }
 
+function slugifyName(value: string) {
+  return normalizeName(value)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function getLocalDateTimeInputValue(date = new Date()) {
+  const offsetMs = date.getTimezoneOffset() * 60000;
+  return new Date(date.getTime() - offsetMs).toISOString().slice(0, 16);
+}
+
+function escapeCsvValue(value: unknown) {
+  const text = String(value ?? "");
+  return /[",\n\r;]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function downloadCsv(filename: string, rows: Array<Record<string, unknown>>) {
+  if (!rows.length) return;
+
+  const headers = Object.keys(rows[0]);
+  const csv = [
+    headers.map(escapeCsvValue).join(";"),
+    ...rows.map((row) => headers.map((header) => escapeCsvValue(row[header])).join(";"))
+  ].join("\n");
+  const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
 export default function Home() {
   const [config, setConfig] = useState<PricingConfig>({ ...DEFAULT_CONFIG, rates: { ...DEFAULT_CONFIG.rates } });
   const [users, setUsers] = useState<AppUser[]>(DEFAULT_USERS);
@@ -515,7 +553,7 @@ export default function Home() {
 
   const [selectedDriverId, setSelectedDriverId] = useState(DEFAULT_DRIVERS[0].id);
   const [selectedClientId, setSelectedClientId] = useState(DEFAULT_CLIENTS[0].id);
-  const [selectedPassengerId, setSelectedPassengerId] = useState(DEFAULT_PASSENGERS[0].id);
+  const [passengerInput, setPassengerInput] = useState(DEFAULT_PASSENGERS[0].name);
   const [manualKm, setManualKm] = useState(0);
   const [useManualAmount, setUseManualAmount] = useState(false);
   const [manualTripAmount, setManualTripAmount] = useState(0);
@@ -529,6 +567,7 @@ export default function Home() {
 
   const [cashConcept, setCashConcept] = useState("");
   const [cashAmount, setCashAmount] = useState(0);
+  const [cashDate, setCashDate] = useState(getLocalDateTimeInputValue());
   const [cashKind, setCashKind] = useState<CashEntryKind>("income");
   const [cashBox, setCashBox] = useState<CashBox>("cash");
   const [incomeReason, setIncomeReason] = useState<IncomeReason>("manual");
@@ -580,8 +619,8 @@ export default function Home() {
     [clients, selectedClientId]
   );
   const selectedPassenger = useMemo(
-    () => passengers.find((passenger) => passenger.id === selectedPassengerId) ?? null,
-    [passengers, selectedPassengerId]
+    () => passengers.find((passenger) => passenger.name.toLowerCase() === normalizeName(passengerInput).toLowerCase()) ?? null,
+    [passengerInput, passengers]
   );
 
   const quote = useMemo(() => {
@@ -641,15 +680,21 @@ export default function Home() {
   }, [clientLedger, clients]);
 
   const passengerBalances = useMemo(() => {
-    const amounts = new Map<string, number>();
-    passengers.forEach((passenger) => amounts.set(passenger.id, 0));
+    const amounts = new Map<string, { id: string; name: string; balance: number }>();
+    passengers.forEach((passenger) => amounts.set(passenger.id, { ...passenger, balance: 0 }));
     passengerLedger.forEach((entry) => {
-      amounts.set(entry.passengerId, (amounts.get(entry.passengerId) || 0) + entry.amount);
+      const current = amounts.get(entry.passengerId) || {
+        id: entry.passengerId,
+        name: entry.passengerName,
+        balance: 0
+      };
+      amounts.set(entry.passengerId, {
+        ...current,
+        name: current.name || entry.passengerName,
+        balance: current.balance + entry.amount
+      });
     });
-    return passengers.map((passenger) => ({
-      ...passenger,
-      balance: amounts.get(passenger.id) || 0
-    }));
+    return Array.from(amounts.values());
   }, [passengerLedger, passengers]);
 
   const driverBalances = useMemo(() => {
@@ -759,12 +804,14 @@ export default function Home() {
     ]);
   }
 
-  function addCashEntry(entry: Omit<CashEntry, "id" | "createdAt">) {
+  function addCashEntry(entry: Omit<CashEntry, "id" | "createdAt"> & { createdAt?: string }) {
+    const { createdAt, ...cashEntry } = entry;
+
     setCashEntries((current) => [
       {
         id: makeId("cash"),
-        createdAt: new Date().toISOString(),
-        ...entry
+        createdAt: createdAt || new Date().toISOString(),
+        ...cashEntry
       },
       ...current
     ]);
@@ -908,22 +955,16 @@ export default function Home() {
   }, [clients, selectedClientId]);
 
   useEffect(() => {
-    if (!passengers.length) return;
-    if (passengers.some((passenger) => passenger.id === selectedPassengerId)) return;
-    setSelectedPassengerId(passengers[0].id);
-  }, [passengers, selectedPassengerId]);
-
-  useEffect(() => {
     if (!drivers.length) return;
     if (drivers.some((driver) => driver.id === cashDriverId)) return;
     setCashDriverId(drivers[0].id);
   }, [cashDriverId, drivers]);
 
   useEffect(() => {
-    if (!passengers.length) return;
-    if (passengers.some((passenger) => passenger.id === cashPassengerId)) return;
-    setCashPassengerId(passengers[0].id);
-  }, [cashPassengerId, passengers]);
+    if (!passengerBalances.length) return;
+    if (passengerBalances.some((passenger) => passenger.id === cashPassengerId)) return;
+    setCashPassengerId(passengerBalances[0].id);
+  }, [cashPassengerId, passengerBalances]);
 
   useEffect(() => {
     if (!clients.length) return;
@@ -1156,8 +1197,23 @@ export default function Home() {
     });
   }
 
+  function resolvePassengerForTrip() {
+    const name = normalizeName(passengerInput);
+    if (!name) return null;
+
+    const savedPassenger = passengers.find((passenger) => passenger.name.toLowerCase() === name.toLowerCase());
+    if (savedPassenger) return savedPassenger;
+
+    return {
+      id: `sporadic-passenger-${slugifyName(name) || makeId("passenger")}`,
+      name
+    };
+  }
+
   function handleQueueTrip() {
-    if (!selectedDriver || !selectedPassenger) {
+    const passenger = resolvePassengerForTrip();
+
+    if (!selectedDriver || !passenger) {
       setMessage("Selecciona chofer y pasajero validos.");
       setMessageType("error");
       return;
@@ -1181,8 +1237,8 @@ export default function Home() {
       createdAt: new Date().toISOString(),
       driverId: selectedDriver.id,
       driverName: selectedDriver.name,
-      passengerId: selectedPassenger.id,
-      passengerName: selectedPassenger.name,
+      passengerId: passenger.id,
+      passengerName: passenger.name,
       clientId: selectedClient?.id || DEFAULT_CLIENTS[0].id,
       clientName: selectedClient?.name || DEFAULT_CLIENTS[0].name,
       origin,
@@ -1645,9 +1701,16 @@ export default function Home() {
     event.preventDefault();
     const concept = normalizeName(cashConcept);
     const amount = Math.max(0, parseNumberInput(String(cashAmount)));
+    const movementDate = cashDate ? new Date(cashDate) : new Date();
 
     if (!concept || amount <= 0) {
       setMessage("Completa concepto y monto.");
+      setMessageType("error");
+      return;
+    }
+
+    if (Number.isNaN(movementDate.getTime())) {
+      setMessage("La fecha del movimiento no es valida.");
       setMessageType("error");
       return;
     }
@@ -1658,7 +1721,7 @@ export default function Home() {
     if (cashKind === "income") {
       reason = incomeReason === "pending_payment" ? "pending_payment" : "manual";
       if (incomeReason === "pending_payment") {
-        const passenger = passengers.find((item) => item.id === cashPassengerId);
+        const passenger = passengerBalances.find((item) => item.id === cashPassengerId);
         if (!passenger) {
           setMessage("Selecciona un pasajero valido.");
           setMessageType("error");
@@ -1699,10 +1762,12 @@ export default function Home() {
       kind: cashKind,
       reason,
       box: cashBox,
-      linkedName
+      linkedName,
+      createdAt: movementDate.toISOString()
     });
     setCashConcept("");
     setCashAmount(0);
+    setCashDate(getLocalDateTimeInputValue());
     registerAudit(
       `Caja (${getCashBoxLabel(cashBox)}): ${cashKind === "income" ? "ingreso" : "egreso"} ${formatCurrency(amount)}.`
     );
@@ -1713,6 +1778,164 @@ export default function Home() {
     setMessage("Configuracion guardada.");
     setMessageType("success");
     registerAudit("Configuracion de tarifas actualizada.");
+  }
+
+  function downloadPassengerAccountCsv(passenger: Passenger & { balance: number }) {
+    const entries = passengerLedger
+      .filter((entry) => entry.passengerId === passenger.id)
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    let balance = 0;
+    const rows = entries.map((entry) => {
+      balance += entry.amount;
+      return {
+        Fecha: new Date(entry.createdAt).toLocaleString("es-AR"),
+        Pasajero: passenger.name,
+        Concepto: entry.concept,
+        Origen: entry.source,
+        Debe: entry.amount < 0 ? Math.abs(entry.amount) : "",
+        Haber: entry.amount > 0 ? entry.amount : "",
+        Saldo: balance
+      };
+    });
+
+    downloadCsv(
+      `cuenta-pasajero-${slugifyName(passenger.name) || passenger.id}.csv`,
+      rows.length
+        ? rows
+        : [
+            {
+              Fecha: "",
+              Pasajero: passenger.name,
+              Concepto: "Sin movimientos",
+              Origen: "",
+              Debe: "",
+              Haber: "",
+              Saldo: passenger.balance
+            }
+          ]
+    );
+  }
+
+  function downloadClientAccountCsv(client: CorporateClient & { balance: number }) {
+    const entries = clientLedger
+      .filter((entry) => entry.clientId === client.id)
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    let balance = 0;
+    const rows = entries.map((entry) => {
+      balance += entry.amount;
+      return {
+        Fecha: new Date(entry.createdAt).toLocaleString("es-AR"),
+        Cliente: client.name,
+        Concepto: entry.concept,
+        Origen: entry.source,
+        Debe: entry.amount < 0 ? Math.abs(entry.amount) : "",
+        Haber: entry.amount > 0 ? entry.amount : "",
+        Saldo: balance
+      };
+    });
+
+    downloadCsv(
+      `cuenta-cliente-${slugifyName(client.name) || client.id}.csv`,
+      rows.length
+        ? rows
+        : [
+            {
+              Fecha: "",
+              Cliente: client.name,
+              Concepto: "Sin movimientos",
+              Origen: "",
+              Debe: "",
+              Haber: "",
+              Saldo: client.balance
+            }
+          ]
+    );
+  }
+
+  function downloadFullBackupCsv() {
+    const rows = [
+      ...confirmedTrips.map((trip) => ({
+        Tipo: "viaje_confirmado",
+        Fecha: new Date(trip.confirmedAt).toLocaleString("es-AR"),
+        ID: trip.id,
+        Nombre: trip.passengerName,
+        Cliente: trip.clientName,
+        Chofer: trip.driverName,
+        Caja: "",
+        Concepto: `${trip.origin} -> ${trip.destination}`,
+        FormaCobro: PAYMENT_OPTIONS.find((option) => option.value === trip.paymentMode)?.title || trip.paymentMode,
+        Monto: trip.totalAmount
+      })),
+      ...pendingTrips.map((trip) => ({
+        Tipo: "viaje_pendiente",
+        Fecha: new Date(trip.createdAt).toLocaleString("es-AR"),
+        ID: trip.id,
+        Nombre: trip.passengerName,
+        Cliente: trip.clientName,
+        Chofer: trip.driverName,
+        Caja: "",
+        Concepto: `${trip.origin} -> ${trip.destination}`,
+        FormaCobro: PAYMENT_OPTIONS.find((option) => option.value === trip.paymentMode)?.title || trip.paymentMode,
+        Monto: trip.totalAmount
+      })),
+      ...cashEntries.map((entry) => ({
+        Tipo: "movimiento_caja",
+        Fecha: new Date(entry.createdAt).toLocaleString("es-AR"),
+        ID: entry.id,
+        Nombre: entry.linkedName || "",
+        Cliente: "",
+        Chofer: "",
+        Caja: getCashBoxLabel(entry.box),
+        Concepto: entry.concept,
+        FormaCobro: entry.kind === "income" ? "Ingreso" : "Egreso",
+        Monto: entry.kind === "income" ? entry.amount : -entry.amount
+      })),
+      ...passengerLedger.map((entry) => ({
+        Tipo: "cuenta_pasajero",
+        Fecha: new Date(entry.createdAt).toLocaleString("es-AR"),
+        ID: entry.id,
+        Nombre: entry.passengerName,
+        Cliente: "",
+        Chofer: "",
+        Caja: "",
+        Concepto: entry.concept,
+        FormaCobro: entry.source,
+        Monto: entry.amount
+      })),
+      ...clientLedger.map((entry) => ({
+        Tipo: "cuenta_cliente",
+        Fecha: new Date(entry.createdAt).toLocaleString("es-AR"),
+        ID: entry.id,
+        Nombre: "",
+        Cliente: entry.clientName,
+        Chofer: "",
+        Caja: "",
+        Concepto: entry.concept,
+        FormaCobro: entry.source,
+        Monto: entry.amount
+      })),
+      ...driverLedger.map((entry) => ({
+        Tipo: "cuenta_chofer",
+        Fecha: new Date(entry.createdAt).toLocaleString("es-AR"),
+        ID: entry.id,
+        Nombre: "",
+        Cliente: "",
+        Chofer: entry.driverName,
+        Caja: "",
+        Concepto: entry.concept,
+        FormaCobro: entry.source,
+        Monto: entry.amount
+      }))
+    ];
+
+    if (!rows.length) {
+      setMessage("No hay viajes ni movimientos para exportar.");
+      setMessageType("error");
+      return;
+    }
+
+    downloadCsv(`backup-mi-chofer-${getLocalDateTimeInputValue().slice(0, 10)}.csv`, rows);
+    registerAudit("Backup CSV descargado.");
   }
 
   if (!currentUser) {
@@ -1795,7 +2018,7 @@ export default function Home() {
         ) : null}
         {canCash ? (
           <button className={activeTab === "cash" ? "active" : ""} type="button" onClick={() => setActiveTab("cash")}>
-            Caja
+            Registrar movimiento
           </button>
         ) : null}
         {canCash ? (
@@ -1839,13 +2062,18 @@ export default function Home() {
               </label>
               <label>
                 Pasajero
-                <select value={selectedPassengerId} onChange={(event) => setSelectedPassengerId(event.target.value)}>
+                <input
+                  list="passenger-options"
+                  value={passengerInput}
+                  onChange={(event) => setPassengerInput(event.target.value)}
+                  placeholder="Elegir o escribir pasajero"
+                  required
+                />
+                <datalist id="passenger-options">
                   {passengers.map((passenger) => (
-                    <option key={passenger.id} value={passenger.id}>
-                      {passenger.name}
-                    </option>
+                    <option key={passenger.id} value={passenger.name} />
                   ))}
-                </select>
+                </datalist>
               </label>
               <label>
                 Cliente / comisionista
@@ -2025,7 +2253,7 @@ export default function Home() {
               </div>
               <div>
                 <dt>Pasajero</dt>
-                <dd>{selectedPassenger?.name || "-"}</dd>
+                <dd>{normalizeName(passengerInput) || selectedPassenger?.name || "-"}</dd>
               </div>
               <div>
                 <dt>Cliente / comisionista</dt>
@@ -2240,6 +2468,7 @@ export default function Home() {
                   <tr>
                     <th>Pasajero</th>
                     <th>Saldo</th>
+                    <th>Detalle</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -2248,6 +2477,11 @@ export default function Home() {
                       <td>{passenger.name}</td>
                       <td className={passenger.balance >= 0 ? "balance-positive" : "balance-negative"}>
                         {formatCurrency(passenger.balance)}
+                      </td>
+                      <td>
+                        <button className="secondary" type="button" onClick={() => downloadPassengerAccountCsv(passenger)}>
+                          Descargar CSV
+                        </button>
                       </td>
                     </tr>
                   ))}
@@ -2265,6 +2499,7 @@ export default function Home() {
                   <tr>
                     <th>Cliente</th>
                     <th>Saldo</th>
+                    <th>Detalle</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -2273,6 +2508,11 @@ export default function Home() {
                       <td>{client.name}</td>
                       <td className={client.balance >= 0 ? "balance-positive" : "balance-negative"}>
                         {formatCurrency(client.balance)}
+                      </td>
+                      <td>
+                        <button className="secondary" type="button" onClick={() => downloadClientAccountCsv(client)}>
+                          Descargar CSV
+                        </button>
                       </td>
                     </tr>
                   ))}
@@ -2310,10 +2550,19 @@ export default function Home() {
       ) : null}
 
       {activeTab === "cash" && canCash ? (
-        <section className="panel grid-two">
+        <section className="panel">
           <article className="card">
             <h2>Registrar movimiento</h2>
             <form className="form-grid" onSubmit={handleAddCash}>
+              <label>
+                Fecha del movimiento
+                <input
+                  type="datetime-local"
+                  value={cashDate}
+                  onChange={(event) => setCashDate(event.target.value)}
+                  required
+                />
+              </label>
               <label>
                 Caja destino
                 <select value={cashBox} onChange={(event) => setCashBox(event.target.value as CashBox)}>
@@ -2360,7 +2609,7 @@ export default function Home() {
                 <label>
                   Pasajero
                   <select value={cashPassengerId} onChange={(event) => setCashPassengerId(event.target.value)}>
-                    {passengers.map((passenger) => (
+                    {passengerBalances.map((passenger) => (
                       <option key={passenger.id} value={passenger.id}>
                         {passenger.name}
                       </option>
@@ -2406,17 +2655,43 @@ export default function Home() {
               del 12%.
             </p>
           </article>
+        </section>
+      ) : null}
 
+      {activeTab === "cashMovements" && canCash ? (
+        <section className="panel">
           <article className="card">
-            <h2>Resumen de caja</h2>
+            <div className="section-title-row">
+              <div>
+                <h2>Movimientos de caja</h2>
+                <p className="help-note">Filtra por caja o revisa todos los ingresos y egresos.</p>
+              </div>
+              <div className="header-actions">
+                <button className="secondary" type="button" onClick={downloadFullBackupCsv}>
+                  Descargar backup CSV
+                </button>
+                <label className="compact-filter">
+                  Caja
+                  <select
+                    value={selectedCashBoxFilter}
+                    onChange={(event) => setSelectedCashBoxFilter(event.target.value as CashBox | "all")}
+                  >
+                    <option value="all">Todas las cajas</option>
+                    {CASH_BOX_OPTIONS.map((box) => (
+                      <option key={box.value} value={box.value}>
+                        {box.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </div>
+
             <div className="box-balance-grid">
               <button
                 className="box-balance-item"
                 type="button"
-                onClick={() => {
-                  setSelectedCashBoxFilter("cash");
-                  setActiveTab("cashMovements");
-                }}
+                onClick={() => setSelectedCashBoxFilter("cash")}
               >
                 <span>Caja efectivo</span>
                 <strong>{formatCurrency(boxBalances.cash)}</strong>
@@ -2424,10 +2699,7 @@ export default function Home() {
               <button
                 className="box-balance-item"
                 type="button"
-                onClick={() => {
-                  setSelectedCashBoxFilter("uber_cash");
-                  setActiveTab("cashMovements");
-                }}
+                onClick={() => setSelectedCashBoxFilter("uber_cash")}
               >
                 <span>Caja efectivo Uber</span>
                 <strong>{formatCurrency(boxBalances.uber_cash)}</strong>
@@ -2435,10 +2707,7 @@ export default function Home() {
               <button
                 className="box-balance-item"
                 type="button"
-                onClick={() => {
-                  setSelectedCashBoxFilter("mercado_pago");
-                  setActiveTab("cashMovements");
-                }}
+                onClick={() => setSelectedCashBoxFilter("mercado_pago")}
               >
                 <span>Caja Mercado Pago</span>
                 <strong>{formatCurrency(boxBalances.mercado_pago)}</strong>
@@ -2446,15 +2715,13 @@ export default function Home() {
               <button
                 className="box-balance-item"
                 type="button"
-                onClick={() => {
-                  setSelectedCashBoxFilter("galicia_paul");
-                  setActiveTab("cashMovements");
-                }}
+                onClick={() => setSelectedCashBoxFilter("galicia_paul")}
               >
                 <span>Caja Banco Galicia Paul</span>
                 <strong>{formatCurrency(boxBalances.galicia_paul)}</strong>
               </button>
             </div>
+
             <dl className="summary-list">
               <div>
                 <dt>Total ingresos</dt>
@@ -2469,44 +2736,6 @@ export default function Home() {
                 <dd>{formatCurrency(cashBalance)}</dd>
               </div>
             </dl>
-
-            <button
-              className="secondary"
-              type="button"
-              onClick={() => {
-                setSelectedCashBoxFilter("all");
-                setActiveTab("cashMovements");
-              }}
-            >
-              Ver todos los movimientos
-            </button>
-          </article>
-        </section>
-      ) : null}
-
-      {activeTab === "cashMovements" && canCash ? (
-        <section className="panel">
-          <article className="card">
-            <div className="section-title-row">
-              <div>
-                <h2>Movimientos de caja</h2>
-                <p className="help-note">Filtra por caja o revisa todos los ingresos y egresos.</p>
-              </div>
-              <label className="compact-filter">
-                Caja
-                <select
-                  value={selectedCashBoxFilter}
-                  onChange={(event) => setSelectedCashBoxFilter(event.target.value as CashBox | "all")}
-                >
-                  <option value="all">Todas las cajas</option>
-                  {CASH_BOX_OPTIONS.map((box) => (
-                    <option key={box.value} value={box.value}>
-                      {box.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
 
             <div className="table-wrap">
               <table>

@@ -39,6 +39,11 @@ Archivos principales:
 - Movimientos de caja en pagina separada con filtro por caja.
 - Edicion de forma de cobro y monto en viajes pendientes.
 - Eliminacion de usuarios no principales desde Configuracion.
+- Pasajero escribible en calculadora, con sugerencias de pasajeros guardados.
+- Registro de movimientos en pantalla propia con fecha editable.
+- Resumen de caja dentro de Movimientos.
+- Exportacion CSV de detalles de cuenta corriente.
+- Backup CSV general de viajes y movimientos.
 
 ## Credenciales por defecto
 
