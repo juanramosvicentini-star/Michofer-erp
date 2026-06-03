@@ -44,6 +44,7 @@ Archivos principales:
 - Resumen de caja dentro de Movimientos.
 - Exportacion CSV de detalles de cuenta corriente.
 - Backup CSV general de viajes y movimientos.
+- Sincronizacion con Neon mediante `/api/state`, usando `DATABASE_URL`.
 
 ## Credenciales por defecto
 
@@ -85,7 +86,25 @@ Luego aplica hora pico, hotel, peajes, espera y recargo de posnet si corresponde
 
 ## Persistencia
 
-La app usa `localStorage` para guardar configuracion, usuarios, choferes, clientes, pasajeros, viajes, cuentas, caja, auditorias y API key.
+La app usa Neon como base compartida si Vercel tiene `DATABASE_URL` o una variable prefijada de Neon, por ejemplo `michofererp_DATABASE_URL`. Si Neon no responde, conserva `localStorage` como respaldo para no bloquear la operacion.
+
+El endpoint creado es:
+
+```txt
+app\api\state\route.ts
+```
+
+Guarda el estado en la tabla `mi_chofer_state`.
+
+Tambien conserva `localStorage` para compatibilidad con datos anteriores.
+
+Primer deploy con Neon:
+
+1. Verificar que Vercel tenga `DATABASE_URL`.
+2. Deployar esta carpeta.
+3. Abrir primero la app desde la computadora/navegador donde estan los datos actuales.
+4. La app compara datos locales vs Neon y sube el estado mas completo.
+5. Luego abrir desde el telefono para ver los mismos datos.
 
 Keys detectadas:
 

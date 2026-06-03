@@ -150,6 +150,21 @@ type AuditEntry = {
   action: string;
 };
 
+type RemoteAppState = {
+  config?: Partial<PricingConfig>;
+  users?: AppUser[];
+  drivers?: Driver[];
+  clients?: CorporateClient[];
+  passengers?: Passenger[];
+  pendingTrips?: PendingTrip[];
+  confirmedTrips?: ConfirmedTrip[];
+  clientLedger?: ClientLedgerEntry[];
+  passengerLedger?: PassengerLedgerEntry[];
+  driverLedger?: DriverLedgerEntry[];
+  cashEntries?: CashEntry[];
+  audits?: AuditEntry[];
+};
+
 type RouteSummary = {
   distanceKm: number;
   durationSeconds: number;
@@ -751,6 +766,87 @@ export default function Home() {
     window.localStorage.setItem(key, JSON.stringify(value));
   }
 
+  function readLocalState(): RemoteAppState {
+    return {
+      config: readStorage<Partial<PricingConfig> | null>(STORAGE_KEYS.config, null) || undefined,
+      users: readStorage<AppUser[]>(STORAGE_KEYS.users, DEFAULT_USERS),
+      drivers: readStorage<Driver[]>(STORAGE_KEYS.drivers, DEFAULT_DRIVERS),
+      clients: readStorage<CorporateClient[]>(STORAGE_KEYS.clients, DEFAULT_CLIENTS),
+      passengers: readStorage<Passenger[]>(STORAGE_KEYS.passengers, []),
+      pendingTrips: readStorage<PendingTrip[]>(STORAGE_KEYS.pendingTrips, []),
+      confirmedTrips: readStorage<ConfirmedTrip[]>(STORAGE_KEYS.confirmedTrips, []),
+      clientLedger: readStorage<ClientLedgerEntry[]>(STORAGE_KEYS.clientLedger, []),
+      passengerLedger: readStorage<PassengerLedgerEntry[]>(STORAGE_KEYS.passengerLedger, []),
+      driverLedger: readStorage<DriverLedgerEntry[]>(STORAGE_KEYS.driverLedger, []),
+      cashEntries: readStorage<CashEntry[]>(STORAGE_KEYS.cash, []),
+      audits: readStorage<AuditEntry[]>(STORAGE_KEYS.audits, [])
+    };
+  }
+
+  function getStateWeight(state: RemoteAppState | null) {
+    if (!state) return 0;
+
+    return (
+      (state.users?.length || 0) +
+      (state.drivers?.length || 0) +
+      (state.clients?.length || 0) +
+      (state.passengers?.length || 0) +
+      (state.pendingTrips?.length || 0) * 4 +
+      (state.confirmedTrips?.length || 0) * 4 +
+      (state.clientLedger?.length || 0) * 3 +
+      (state.passengerLedger?.length || 0) * 3 +
+      (state.driverLedger?.length || 0) * 3 +
+      (state.cashEntries?.length || 0) * 4 +
+      (state.audits?.length || 0)
+    );
+  }
+
+  async function readRemoteState(): Promise<RemoteAppState | null> {
+    try {
+      const response = await fetch("/api/state", {
+        cache: "no-store"
+      });
+
+      if (!response.ok) return null;
+
+      const payload = (await response.json()) as { data?: RemoteAppState | null };
+      return payload.data || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function writeRemoteState(data: RemoteAppState) {
+    try {
+      await fetch("/api/state", {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ data })
+      });
+    } catch {
+      // Si Neon no esta disponible, localStorage sigue funcionando como respaldo.
+    }
+  }
+
+  function getPersistedState(): RemoteAppState {
+    return {
+      config,
+      users,
+      drivers,
+      clients,
+      passengers,
+      pendingTrips,
+      confirmedTrips,
+      clientLedger,
+      passengerLedger,
+      driverLedger,
+      cashEntries,
+      audits
+    };
+  }
+
   function getNumberInputValue(fieldName: string, value: number) {
     return activeNumberField === fieldName && value === 0 ? "" : value;
   }
@@ -818,68 +914,75 @@ export default function Home() {
   }
 
   useEffect(() => {
-    const savedConfig = readStorage<Partial<PricingConfig> | null>(STORAGE_KEYS.config, null);
-    const savedUsers = readStorage<AppUser[]>(STORAGE_KEYS.users, DEFAULT_USERS);
-    const savedDrivers = readStorage<Driver[]>(STORAGE_KEYS.drivers, DEFAULT_DRIVERS);
-    const savedClients = readStorage<CorporateClient[]>(STORAGE_KEYS.clients, DEFAULT_CLIENTS);
-    const savedPassengers = readStorage<Passenger[]>(STORAGE_KEYS.passengers, []);
-    const savedPendingTrips = readStorage<PendingTrip[]>(STORAGE_KEYS.pendingTrips, []);
-    const savedConfirmedTrips = readStorage<ConfirmedTrip[]>(STORAGE_KEYS.confirmedTrips, []);
-    const savedClientLedger = readStorage<ClientLedgerEntry[]>(STORAGE_KEYS.clientLedger, []);
-    const savedPassengerLedger = readStorage<PassengerLedgerEntry[]>(STORAGE_KEYS.passengerLedger, []);
-    const savedDriverLedger = readStorage<DriverLedgerEntry[]>(STORAGE_KEYS.driverLedger, []);
-    const savedCash = readStorage<CashEntry[]>(STORAGE_KEYS.cash, []);
-    const savedAudits = readStorage<AuditEntry[]>(STORAGE_KEYS.audits, []);
-    const normalizedClients = savedClients.length ? savedClients : DEFAULT_CLIENTS;
-    const normalizedPassengers = mergePassengerLists(
-      normalizePassengers(savedPassengers),
-      savedPassengers.length
-        ? []
-        : normalizedClients.map((client) => ({ id: client.id, name: client.name })),
-      DEFAULT_PASSENGERS
-    );
-    const legacyPassengerLedger = savedClientLedger
-      .filter((entry) => entry.source !== "hotel")
-      .map((entry) => ({
-        id: entry.id,
-        createdAt: entry.createdAt,
-        passengerId: entry.clientId,
-        passengerName: entry.clientName,
-        amount: entry.amount,
-        concept: entry.concept,
-        source:
-          entry.source === "trip" || entry.source === "pending_payment"
-            ? entry.source
-            : ("manual" as PassengerLedgerEntry["source"])
-      }));
+    async function hydrateApp() {
+      const remoteState = await readRemoteState();
+      const localState = readLocalState();
+      const savedState = getStateWeight(localState) > getStateWeight(remoteState) ? localState : remoteState || localState;
+      const savedConfig = savedState.config || null;
+      const savedUsers = savedState.users || DEFAULT_USERS;
+      const savedDrivers = savedState.drivers || DEFAULT_DRIVERS;
+      const savedClients = savedState.clients || DEFAULT_CLIENTS;
+      const savedPassengers = savedState.passengers || [];
+      const savedPendingTrips = savedState.pendingTrips || [];
+      const savedConfirmedTrips = savedState.confirmedTrips || [];
+      const savedClientLedger = savedState.clientLedger || [];
+      const savedPassengerLedger = savedState.passengerLedger || [];
+      const savedDriverLedger = savedState.driverLedger || [];
+      const savedCash = savedState.cashEntries || [];
+      const savedAudits = savedState.audits || [];
+      const normalizedClients = savedClients.length ? savedClients : DEFAULT_CLIENTS;
+      const normalizedPassengers = mergePassengerLists(
+        normalizePassengers(savedPassengers),
+        savedPassengers.length
+          ? []
+          : normalizedClients.map((client) => ({ id: client.id, name: client.name })),
+        DEFAULT_PASSENGERS
+      );
+      const legacyPassengerLedger = savedClientLedger
+        .filter((entry) => entry.source !== "hotel")
+        .map((entry) => ({
+          id: entry.id,
+          createdAt: entry.createdAt,
+          passengerId: entry.clientId,
+          passengerName: entry.clientName,
+          amount: entry.amount,
+          concept: entry.concept,
+          source:
+            entry.source === "trip" || entry.source === "pending_payment"
+              ? entry.source
+              : ("manual" as PassengerLedgerEntry["source"])
+        }));
 
-    setConfig(mergeConfig(savedConfig));
-    setUsers(normalizeUsers(savedUsers.length ? savedUsers : DEFAULT_USERS));
-    setDrivers(normalizeDrivers(savedDrivers.length ? savedDrivers : DEFAULT_DRIVERS));
-    setClients(normalizedClients);
-    setPassengers(normalizedPassengers);
-    setPendingTrips(normalizeTripsWithPassengers(savedPendingTrips, normalizedPassengers));
-    setConfirmedTrips(normalizeTripsWithPassengers(savedConfirmedTrips, normalizedPassengers));
-    setClientLedger(savedPassengerLedger.length ? savedClientLedger : savedClientLedger.filter((entry) => entry.source === "hotel"));
-    setPassengerLedger(savedPassengerLedger.length ? savedPassengerLedger : legacyPassengerLedger);
-    setDriverLedger(savedDriverLedger);
-    setCashEntries(normalizeCashEntries(savedCash));
-    setAudits(savedAudits);
+      setConfig(mergeConfig(savedConfig));
+      setUsers(normalizeUsers(savedUsers.length ? savedUsers : DEFAULT_USERS));
+      setDrivers(normalizeDrivers(savedDrivers.length ? savedDrivers : DEFAULT_DRIVERS));
+      setClients(normalizedClients);
+      setPassengers(normalizedPassengers);
+      setPendingTrips(normalizeTripsWithPassengers(savedPendingTrips, normalizedPassengers));
+      setConfirmedTrips(normalizeTripsWithPassengers(savedConfirmedTrips, normalizedPassengers));
+      setClientLedger(savedPassengerLedger.length ? savedClientLedger : savedClientLedger.filter((entry) => entry.source === "hotel"));
+      setPassengerLedger(savedPassengerLedger.length ? savedPassengerLedger : legacyPassengerLedger);
+      setDriverLedger(savedDriverLedger);
+      setCashEntries(normalizeCashEntries(savedCash));
+      setAudits(savedAudits);
 
-    const envApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY?.trim();
-    const storedApiKey = window.localStorage.getItem(STORAGE_KEYS.maps)?.trim();
-    const chosenApiKey = envApiKey || storedApiKey || DEFAULT_PUBLIC_GOOGLE_MAPS_API_KEY;
+      const envApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY?.trim();
+      const storedApiKey = window.localStorage.getItem(STORAGE_KEYS.maps)?.trim();
+      const chosenApiKey = envApiKey || storedApiKey || DEFAULT_PUBLIC_GOOGLE_MAPS_API_KEY;
 
-    if (chosenApiKey) {
-      setApiKeyInput(chosenApiKey);
-      setActiveApiKey(chosenApiKey);
-    } else {
-      setNeedsApiKey(true);
-      setMessage("Google Maps esta en modo manual. Carga una API key para rutas reales.");
-      setMessageType("default");
+      if (chosenApiKey) {
+        setApiKeyInput(chosenApiKey);
+        setActiveApiKey(chosenApiKey);
+      } else {
+        setNeedsApiKey(true);
+        setMessage("Google Maps esta en modo manual. Carga una API key para rutas reales.");
+        setMessageType("default");
+      }
+
+      setHasHydrated(true);
     }
 
-    setHasHydrated(true);
+    hydrateApp();
   }, []);
 
   useEffect(() => {
@@ -941,6 +1044,30 @@ export default function Home() {
     if (!hasHydrated) return;
     writeStorage(STORAGE_KEYS.audits, audits);
   }, [audits, hasHydrated]);
+
+  useEffect(() => {
+    if (!hasHydrated) return;
+
+    const timeout = window.setTimeout(() => {
+      writeRemoteState(getPersistedState());
+    }, 700);
+
+    return () => window.clearTimeout(timeout);
+  }, [
+    audits,
+    cashEntries,
+    clientLedger,
+    clients,
+    config,
+    confirmedTrips,
+    drivers,
+    driverLedger,
+    hasHydrated,
+    passengerLedger,
+    passengers,
+    pendingTrips,
+    users
+  ]);
 
   useEffect(() => {
     if (!drivers.length) return;
