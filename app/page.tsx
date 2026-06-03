@@ -17,7 +17,15 @@ type CashBox = "cash" | "uber_cash" | "mercado_pago" | "galicia_paul";
 type StatusTone = "default" | "success" | "error";
 type IncomeReason = "manual" | "pending_payment";
 type ExpenseReason = "manual" | "commission_payment";
-type AppTab = "calculator" | "pending" | "dashboard" | "accounts" | "cash" | "settings" | "audits";
+type AppTab =
+  | "calculator"
+  | "pending"
+  | "dashboard"
+  | "accounts"
+  | "cash"
+  | "cashMovements"
+  | "settings"
+  | "audits";
 
 type PricingConfig = {
   minimumFare: number;
@@ -60,11 +68,18 @@ type CorporateClient = {
   name: string;
 };
 
+type Passenger = {
+  id: string;
+  name: string;
+};
+
 type PendingTrip = {
   id: string;
   createdAt: string;
   driverId: string;
   driverName: string;
+  passengerId: string;
+  passengerName: string;
   clientId: string;
   clientName: string;
   origin: string;
@@ -95,6 +110,16 @@ type ClientLedgerEntry = {
   amount: number;
   concept: string;
   source: "trip" | "pending_payment" | "hotel" | "manual";
+};
+
+type PassengerLedgerEntry = {
+  id: string;
+  createdAt: string;
+  passengerId: string;
+  passengerName: string;
+  amount: number;
+  concept: string;
+  source: "trip" | "pending_payment" | "manual";
 };
 
 type DriverLedgerEntry = {
@@ -178,9 +203,11 @@ const STORAGE_KEYS = {
   users: "miChoferUsers",
   drivers: "miChoferDrivers",
   clients: "miChoferClients",
+  passengers: "miChoferPassengers",
   pendingTrips: "miChoferPendingTrips",
   confirmedTrips: "miChoferConfirmedTrips",
   clientLedger: "miChoferClientLedger",
+  passengerLedger: "miChoferPassengerLedger",
   driverLedger: "miChoferDriverLedger",
   audits: "miChoferAudits",
   cash: "miChoferCashEntries",
@@ -265,6 +292,11 @@ const DEFAULT_CLIENTS: CorporateClient[] = [
   { id: "client-2", name: "Wyndham" }
 ];
 
+const DEFAULT_PASSENGERS: Passenger[] = [
+  { id: "passenger-1", name: "Pasajero particular" },
+  { id: "passenger-2", name: "Wyndham pasajero" }
+];
+
 function makeId(prefix: string) {
   return `${prefix}-${Math.random().toString(36).slice(2, 11)}`;
 }
@@ -290,8 +322,8 @@ function formatCurrency(value: number) {
   return new Intl.NumberFormat("es-AR", {
     style: "currency",
     currency: "ARS",
-    maximumFractionDigits: 0
-  }).format(Math.round(value));
+    maximumFractionDigits: 2
+  }).format(value);
 }
 
 function formatDuration(totalSeconds: number) {
@@ -328,7 +360,7 @@ function mergeConfig(raw: Partial<PricingConfig> | null): PricingConfig {
 }
 
 function normalizeUsers(rawUsers: AppUser[]): AppUser[] {
-  return rawUsers
+  const normalized = rawUsers
     .map((user) => ({
       ...user,
       id: user.id || makeId("user"),
@@ -344,6 +376,24 @@ function normalizeUsers(rawUsers: AppUser[]): AppUser[] {
       }
     }))
     .filter((user) => Boolean(user.username) && Boolean(user.password));
+
+  const defaultAdmin = DEFAULT_USERS.find((user) => user.username === "admin") || DEFAULT_USERS[0];
+  const adminIndex = normalized.findIndex((user) => normalizeUsername(user.username) === defaultAdmin.username);
+
+  if (adminIndex === -1) {
+    normalized.push(defaultAdmin);
+  } else {
+    normalized[adminIndex] = {
+      ...normalized[adminIndex],
+      id: normalized[adminIndex].id || defaultAdmin.id,
+      name: normalized[adminIndex].name || defaultAdmin.name,
+      username: defaultAdmin.username,
+      password: defaultAdmin.password,
+      permissions: { ...defaultAdmin.permissions }
+    };
+  }
+
+  return normalized;
 }
 
 function normalizeDrivers(rawDrivers: Driver[]): Driver[] {
@@ -353,11 +403,51 @@ function normalizeDrivers(rawDrivers: Driver[]): Driver[] {
   }));
 }
 
+function normalizePassengers(rawPassengers: Passenger[]): Passenger[] {
+  return rawPassengers
+    .map((passenger) => ({
+      ...passenger,
+      id: passenger.id || makeId("passenger"),
+      name: normalizeName(passenger.name || "Pasajero")
+    }))
+    .filter((passenger) => Boolean(passenger.name));
+}
+
 function normalizeCashEntries(rawEntries: CashEntry[]): CashEntry[] {
   return rawEntries.map((entry) => ({
     ...entry,
     box: entry.box || "cash"
   }));
+}
+
+function mergePassengerLists(...lists: Passenger[][]) {
+  const seen = new Set<string>();
+  const merged: Passenger[] = [];
+
+  lists.flat().forEach((passenger) => {
+    const name = normalizeName(passenger.name || "");
+    const key = name.toLowerCase();
+    if (!name || seen.has(key)) return;
+    seen.add(key);
+    merged.push({ id: passenger.id || makeId("passenger"), name });
+  });
+
+  return merged.length ? merged : DEFAULT_PASSENGERS;
+}
+
+function normalizeTripsWithPassengers<T extends PendingTrip | ConfirmedTrip>(rawTrips: T[], fallbackPassengers: Passenger[]) {
+  return rawTrips.map((trip) => {
+    const legacyPassengerName = normalizeName(trip.passengerName || trip.clientName || "Pasajero");
+    const passenger =
+      fallbackPassengers.find((item) => item.id === trip.passengerId) ||
+      fallbackPassengers.find((item) => item.name.toLowerCase() === legacyPassengerName.toLowerCase());
+
+    return {
+      ...trip,
+      passengerId: trip.passengerId || passenger?.id || trip.clientId || makeId("passenger"),
+      passengerName: trip.passengerName || passenger?.name || legacyPassengerName
+    };
+  });
 }
 
 function calculateTieredDistancePrice(distanceKm: number, config: PricingConfig) {
@@ -396,10 +486,12 @@ export default function Home() {
   const [users, setUsers] = useState<AppUser[]>(DEFAULT_USERS);
   const [drivers, setDrivers] = useState<Driver[]>(DEFAULT_DRIVERS);
   const [clients, setClients] = useState<CorporateClient[]>(DEFAULT_CLIENTS);
+  const [passengers, setPassengers] = useState<Passenger[]>(DEFAULT_PASSENGERS);
 
   const [pendingTrips, setPendingTrips] = useState<PendingTrip[]>([]);
   const [confirmedTrips, setConfirmedTrips] = useState<ConfirmedTrip[]>([]);
   const [clientLedger, setClientLedger] = useState<ClientLedgerEntry[]>([]);
+  const [passengerLedger, setPassengerLedger] = useState<PassengerLedgerEntry[]>([]);
   const [driverLedger, setDriverLedger] = useState<DriverLedgerEntry[]>([]);
   const [cashEntries, setCashEntries] = useState<CashEntry[]>([]);
   const [audits, setAudits] = useState<AuditEntry[]>([]);
@@ -423,6 +515,7 @@ export default function Home() {
 
   const [selectedDriverId, setSelectedDriverId] = useState(DEFAULT_DRIVERS[0].id);
   const [selectedClientId, setSelectedClientId] = useState(DEFAULT_CLIENTS[0].id);
+  const [selectedPassengerId, setSelectedPassengerId] = useState(DEFAULT_PASSENGERS[0].id);
   const [manualKm, setManualKm] = useState(0);
   const [useManualAmount, setUseManualAmount] = useState(false);
   const [manualTripAmount, setManualTripAmount] = useState(0);
@@ -440,8 +533,9 @@ export default function Home() {
   const [cashBox, setCashBox] = useState<CashBox>("cash");
   const [incomeReason, setIncomeReason] = useState<IncomeReason>("manual");
   const [expenseReason, setExpenseReason] = useState<ExpenseReason>("manual");
-  const [cashClientId, setCashClientId] = useState(DEFAULT_CLIENTS[0].id);
+  const [cashPassengerId, setCashPassengerId] = useState(DEFAULT_PASSENGERS[0].id);
   const [cashDriverId, setCashDriverId] = useState(DEFAULT_DRIVERS[0].id);
+  const [selectedCashBoxFilter, setSelectedCashBoxFilter] = useState<CashBox | "all">("all");
 
   const [newUserName, setNewUserName] = useState("");
   const [newUsername, setNewUsername] = useState("");
@@ -455,6 +549,7 @@ export default function Home() {
   const [newDriverName, setNewDriverName] = useState("");
   const [newDriverRatePercent, setNewDriverRatePercent] = useState(65);
   const [newClientName, setNewClientName] = useState("");
+  const [newPassengerName, setNewPassengerName] = useState("");
   const [activeNumberField, setActiveNumberField] = useState<string | null>(null);
 
   const mapRef = useRef<HTMLDivElement | null>(null);
@@ -483,6 +578,10 @@ export default function Home() {
   const selectedClient = useMemo(
     () => clients.find((client) => client.id === selectedClientId) ?? null,
     [clients, selectedClientId]
+  );
+  const selectedPassenger = useMemo(
+    () => passengers.find((passenger) => passenger.id === selectedPassengerId) ?? null,
+    [passengers, selectedPassengerId]
   );
 
   const quote = useMemo(() => {
@@ -541,6 +640,18 @@ export default function Home() {
     }));
   }, [clientLedger, clients]);
 
+  const passengerBalances = useMemo(() => {
+    const amounts = new Map<string, number>();
+    passengers.forEach((passenger) => amounts.set(passenger.id, 0));
+    passengerLedger.forEach((entry) => {
+      amounts.set(entry.passengerId, (amounts.get(entry.passengerId) || 0) + entry.amount);
+    });
+    return passengers.map((passenger) => ({
+      ...passenger,
+      balance: amounts.get(passenger.id) || 0
+    }));
+  }, [passengerLedger, passengers]);
+
   const driverBalances = useMemo(() => {
     const amounts = new Map<string, number>();
     drivers.forEach((driver) => amounts.set(driver.id, 0));
@@ -572,6 +683,14 @@ export default function Home() {
     return balances;
   }, [cashEntries]);
   const totalBilled = confirmedTrips.reduce((sum, trip) => sum + trip.totalAmount, 0);
+
+  const filteredCashEntries = useMemo(
+    () =>
+      selectedCashBoxFilter === "all"
+        ? cashEntries
+        : cashEntries.filter((entry) => entry.box === selectedCashBoxFilter),
+    [cashEntries, selectedCashBoxFilter]
+  );
 
   function readStorage<T>(key: string, fallback: T): T {
     try {
@@ -618,6 +737,17 @@ export default function Home() {
     ]);
   }
 
+  function addPassengerLedgerEntry(entry: Omit<PassengerLedgerEntry, "id" | "createdAt">) {
+    setPassengerLedger((current) => [
+      {
+        id: makeId("passenger-ledger"),
+        createdAt: new Date().toISOString(),
+        ...entry
+      },
+      ...current
+    ]);
+  }
+
   function addDriverLedgerEntry(entry: Omit<DriverLedgerEntry, "id" | "createdAt">) {
     setDriverLedger((current) => [
       {
@@ -645,20 +775,46 @@ export default function Home() {
     const savedUsers = readStorage<AppUser[]>(STORAGE_KEYS.users, DEFAULT_USERS);
     const savedDrivers = readStorage<Driver[]>(STORAGE_KEYS.drivers, DEFAULT_DRIVERS);
     const savedClients = readStorage<CorporateClient[]>(STORAGE_KEYS.clients, DEFAULT_CLIENTS);
+    const savedPassengers = readStorage<Passenger[]>(STORAGE_KEYS.passengers, []);
     const savedPendingTrips = readStorage<PendingTrip[]>(STORAGE_KEYS.pendingTrips, []);
     const savedConfirmedTrips = readStorage<ConfirmedTrip[]>(STORAGE_KEYS.confirmedTrips, []);
     const savedClientLedger = readStorage<ClientLedgerEntry[]>(STORAGE_KEYS.clientLedger, []);
+    const savedPassengerLedger = readStorage<PassengerLedgerEntry[]>(STORAGE_KEYS.passengerLedger, []);
     const savedDriverLedger = readStorage<DriverLedgerEntry[]>(STORAGE_KEYS.driverLedger, []);
     const savedCash = readStorage<CashEntry[]>(STORAGE_KEYS.cash, []);
     const savedAudits = readStorage<AuditEntry[]>(STORAGE_KEYS.audits, []);
+    const normalizedClients = savedClients.length ? savedClients : DEFAULT_CLIENTS;
+    const normalizedPassengers = mergePassengerLists(
+      normalizePassengers(savedPassengers),
+      savedPassengers.length
+        ? []
+        : normalizedClients.map((client) => ({ id: client.id, name: client.name })),
+      DEFAULT_PASSENGERS
+    );
+    const legacyPassengerLedger = savedClientLedger
+      .filter((entry) => entry.source !== "hotel")
+      .map((entry) => ({
+        id: entry.id,
+        createdAt: entry.createdAt,
+        passengerId: entry.clientId,
+        passengerName: entry.clientName,
+        amount: entry.amount,
+        concept: entry.concept,
+        source:
+          entry.source === "trip" || entry.source === "pending_payment"
+            ? entry.source
+            : ("manual" as PassengerLedgerEntry["source"])
+      }));
 
     setConfig(mergeConfig(savedConfig));
     setUsers(normalizeUsers(savedUsers.length ? savedUsers : DEFAULT_USERS));
     setDrivers(normalizeDrivers(savedDrivers.length ? savedDrivers : DEFAULT_DRIVERS));
-    setClients(savedClients.length ? savedClients : DEFAULT_CLIENTS);
-    setPendingTrips(savedPendingTrips);
-    setConfirmedTrips(savedConfirmedTrips);
-    setClientLedger(savedClientLedger);
+    setClients(normalizedClients);
+    setPassengers(normalizedPassengers);
+    setPendingTrips(normalizeTripsWithPassengers(savedPendingTrips, normalizedPassengers));
+    setConfirmedTrips(normalizeTripsWithPassengers(savedConfirmedTrips, normalizedPassengers));
+    setClientLedger(savedPassengerLedger.length ? savedClientLedger : savedClientLedger.filter((entry) => entry.source === "hotel"));
+    setPassengerLedger(savedPassengerLedger.length ? savedPassengerLedger : legacyPassengerLedger);
     setDriverLedger(savedDriverLedger);
     setCashEntries(normalizeCashEntries(savedCash));
     setAudits(savedAudits);
@@ -701,6 +857,11 @@ export default function Home() {
 
   useEffect(() => {
     if (!hasHydrated) return;
+    writeStorage(STORAGE_KEYS.passengers, passengers);
+  }, [hasHydrated, passengers]);
+
+  useEffect(() => {
+    if (!hasHydrated) return;
     writeStorage(STORAGE_KEYS.pendingTrips, pendingTrips);
   }, [hasHydrated, pendingTrips]);
 
@@ -713,6 +874,11 @@ export default function Home() {
     if (!hasHydrated) return;
     writeStorage(STORAGE_KEYS.clientLedger, clientLedger);
   }, [clientLedger, hasHydrated]);
+
+  useEffect(() => {
+    if (!hasHydrated) return;
+    writeStorage(STORAGE_KEYS.passengerLedger, passengerLedger);
+  }, [hasHydrated, passengerLedger]);
 
   useEffect(() => {
     if (!hasHydrated) return;
@@ -742,16 +908,22 @@ export default function Home() {
   }, [clients, selectedClientId]);
 
   useEffect(() => {
+    if (!passengers.length) return;
+    if (passengers.some((passenger) => passenger.id === selectedPassengerId)) return;
+    setSelectedPassengerId(passengers[0].id);
+  }, [passengers, selectedPassengerId]);
+
+  useEffect(() => {
     if (!drivers.length) return;
     if (drivers.some((driver) => driver.id === cashDriverId)) return;
     setCashDriverId(drivers[0].id);
   }, [cashDriverId, drivers]);
 
   useEffect(() => {
-    if (!clients.length) return;
-    if (clients.some((client) => client.id === cashClientId)) return;
-    setCashClientId(clients[0].id);
-  }, [cashClientId, clients]);
+    if (!passengers.length) return;
+    if (passengers.some((passenger) => passenger.id === cashPassengerId)) return;
+    setCashPassengerId(passengers[0].id);
+  }, [cashPassengerId, passengers]);
 
   useEffect(() => {
     if (!clients.length) return;
@@ -775,6 +947,7 @@ export default function Home() {
     if (canDashboard) allowedTabs.push("dashboard");
     if (canAccounts) allowedTabs.push("accounts");
     if (canCash) allowedTabs.push("cash");
+    if (canCash) allowedTabs.push("cashMovements");
     if (canSettings) allowedTabs.push("settings");
     if (canAudits) allowedTabs.push("audits");
 
@@ -984,8 +1157,8 @@ export default function Home() {
   }
 
   function handleQueueTrip() {
-    if (!selectedDriver || !selectedClient) {
-      setMessage("Selecciona chofer y cliente validos.");
+    if (!selectedDriver || !selectedPassenger) {
+      setMessage("Selecciona chofer y pasajero validos.");
       setMessageType("error");
       return;
     }
@@ -1008,8 +1181,10 @@ export default function Home() {
       createdAt: new Date().toISOString(),
       driverId: selectedDriver.id,
       driverName: selectedDriver.name,
-      clientId: selectedClient.id,
-      clientName: selectedClient.name,
+      passengerId: selectedPassenger.id,
+      passengerName: selectedPassenger.name,
+      clientId: selectedClient?.id || DEFAULT_CLIENTS[0].id,
+      clientName: selectedClient?.name || DEFAULT_CLIENTS[0].name,
       origin,
       destination,
       kilometers: Number(quote.distanceKm.toFixed(2)),
@@ -1033,7 +1208,7 @@ export default function Home() {
     setPendingTrips((current) => [trip, ...current]);
     setMessage("Viaje cargado en pendientes.");
     setMessageType("success");
-    registerAudit(`Viaje cargado en pendientes para ${trip.driverName} - ${trip.clientName}.`);
+    registerAudit(`Viaje cargado en pendientes para ${trip.driverName} - ${trip.passengerName}.`);
   }
 
   function applyTripAccounting(trip: PendingTrip) {
@@ -1052,9 +1227,9 @@ export default function Home() {
     }
 
     if (trip.paymentMode === "pending" || trip.paymentMode === "advance") {
-      addClientLedgerEntry({
-        clientId: trip.clientId,
-        clientName: trip.clientName,
+      addPassengerLedgerEntry({
+        passengerId: trip.passengerId,
+        passengerName: trip.passengerName,
         amount: -Math.round(trip.totalAmount),
         concept:
           trip.paymentMode === "pending"
@@ -1071,7 +1246,7 @@ export default function Home() {
         kind: "income",
         reason: "trip_payment",
         box: "cash",
-        linkedName: `${trip.clientName} / ${trip.driverName}`
+        linkedName: `${trip.passengerName} / ${trip.driverName}`
       });
     }
 
@@ -1082,7 +1257,7 @@ export default function Home() {
         kind: "income",
         reason: "trip_payment",
         box: "uber_cash",
-        linkedName: `${trip.clientName} / ${trip.driverName}`
+        linkedName: `${trip.passengerName} / ${trip.driverName}`
       });
     }
 
@@ -1093,7 +1268,7 @@ export default function Home() {
         kind: "income",
         reason: "trip_payment",
         box: "galicia_paul",
-        linkedName: `${trip.clientName} / ${trip.driverName}`
+        linkedName: `${trip.passengerName} / ${trip.driverName}`
       });
     }
 
@@ -1104,7 +1279,7 @@ export default function Home() {
         kind: "income",
         reason: "trip_payment",
         box: "mercado_pago",
-        linkedName: `${trip.clientName} / ${trip.driverName}`
+        linkedName: `${trip.passengerName} / ${trip.driverName}`
       });
     }
 
@@ -1116,12 +1291,12 @@ export default function Home() {
         kind: "income",
         reason: "trip_payment",
         box: "mercado_pago",
-        linkedName: `${trip.clientName} / ${trip.driverName}`
+        linkedName: `${trip.passengerName} / ${trip.driverName}`
       });
     }
 
     if (trip.hotelTrip && trip.hotelFee > 0) {
-      const hotelClient = clients.find((item) => item.id === config.hotelClientId);
+      const hotelClient = clients.find((item) => item.id === trip.clientId) || clients.find((item) => item.id === config.hotelClientId);
       if (hotelClient) {
         addClientLedgerEntry({
           clientId: hotelClient.id,
@@ -1155,6 +1330,41 @@ export default function Home() {
     const trip = pendingTrips.find((item) => item.id === tripId);
     setPendingTrips((current) => current.filter((item) => item.id !== tripId));
     registerAudit(`Viaje declinado ${trip?.id || tripId}.`);
+  }
+
+  function updatePendingTripPayment(tripId: string, nextPaymentMode: PaymentMode) {
+    setPendingTrips((current) =>
+      current.map((trip) =>
+        trip.id === tripId
+          ? {
+              ...trip,
+              paymentMode: nextPaymentMode
+            }
+          : trip
+      )
+    );
+    registerAudit(`Forma de cobro modificada en viaje pendiente ${tripId}.`);
+  }
+
+  function updatePendingTripAmount(tripId: string, rawAmount: string) {
+    const amount = Math.max(0, parseNumberInput(rawAmount));
+
+    setPendingTrips((current) =>
+      current.map((trip) => {
+        if (trip.id !== tripId) return trip;
+
+        const currentNotes = trip.notes || "Viaje pendiente";
+
+        return {
+          ...trip,
+          baseTotal: amount,
+          totalAmount: amount,
+          notes: currentNotes.includes("monto editado manualmente")
+            ? currentNotes
+            : `${currentNotes} - monto editado manualmente`
+        };
+      })
+    );
   }
 
   function handleLogin(event: FormEvent<HTMLFormElement>) {
@@ -1197,6 +1407,34 @@ export default function Home() {
       )
     );
     registerAudit(`Permiso ${key} ${value ? "habilitado" : "bloqueado"} para ${userId}.`);
+  }
+
+  function removeUser(userId: string) {
+    const user = users.find((item) => item.id === userId);
+    if (!user) return;
+
+    if (user.id === currentUser?.id) {
+      setMessage("No puedes eliminar el usuario con la sesion abierta.");
+      setMessageType("error");
+      return;
+    }
+
+    if (normalizeUsername(user.username) === "admin") {
+      setMessage("El usuario admin principal no se puede eliminar.");
+      setMessageType("error");
+      return;
+    }
+
+    if (users.length <= 1) {
+      setMessage("Debe quedar al menos un usuario.");
+      setMessageType("error");
+      return;
+    }
+
+    setUsers((current) => current.filter((item) => item.id !== userId));
+    setMessage("Usuario eliminado.");
+    setMessageType("success");
+    registerAudit(`Usuario eliminado: ${user.username}.`);
   }
 
   function handleAddUser(event: FormEvent<HTMLFormElement>) {
@@ -1352,10 +1590,61 @@ export default function Home() {
     registerAudit(`Cliente eliminado: ${deleted?.name || clientId}.`);
   }
 
+  function handleAddPassenger(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const name = normalizeName(newPassengerName);
+    if (!name) return;
+
+    if (passengers.some((passenger) => passenger.name.toLowerCase() === name.toLowerCase())) {
+      setMessage("Ese pasajero ya existe.");
+      setMessageType("error");
+      return;
+    }
+
+    const newPassenger: Passenger = {
+      id: makeId("passenger"),
+      name
+    };
+
+    setPassengers((current) => [...current, newPassenger]);
+    setNewPassengerName("");
+    setMessage("Pasajero agregado.");
+    setMessageType("success");
+    registerAudit(`Pasajero agregado: ${name}.`);
+  }
+
+  function removePassenger(passengerId: string) {
+    if (passengers.length <= 1) {
+      setMessage("Debe quedar al menos un pasajero.");
+      setMessageType("error");
+      return;
+    }
+
+    const hasTrips =
+      pendingTrips.some((trip) => trip.passengerId === passengerId) ||
+      confirmedTrips.some((trip) => trip.passengerId === passengerId);
+    if (hasTrips) {
+      setMessage("No puedes eliminar un pasajero con viajes asociados.");
+      setMessageType("error");
+      return;
+    }
+
+    const hasMovements = passengerLedger.some((entry) => entry.passengerId === passengerId);
+    if (hasMovements) {
+      setMessage("No puedes eliminar un pasajero con movimientos de cuenta.");
+      setMessageType("error");
+      return;
+    }
+
+    const deleted = passengers.find((passenger) => passenger.id === passengerId);
+    setPassengers((current) => current.filter((passenger) => passenger.id !== passengerId));
+    registerAudit(`Pasajero eliminado: ${deleted?.name || passengerId}.`);
+  }
+
   function handleAddCash(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const concept = normalizeName(cashConcept);
-    const amount = Math.round(cashAmount);
+    const amount = Math.max(0, parseNumberInput(String(cashAmount)));
 
     if (!concept || amount <= 0) {
       setMessage("Completa concepto y monto.");
@@ -1369,16 +1658,16 @@ export default function Home() {
     if (cashKind === "income") {
       reason = incomeReason === "pending_payment" ? "pending_payment" : "manual";
       if (incomeReason === "pending_payment") {
-        const client = clients.find((item) => item.id === cashClientId);
-        if (!client) {
-          setMessage("Selecciona un cliente valido.");
+        const passenger = passengers.find((item) => item.id === cashPassengerId);
+        if (!passenger) {
+          setMessage("Selecciona un pasajero valido.");
           setMessageType("error");
           return;
         }
-        linkedName = client.name;
-        addClientLedgerEntry({
-          clientId: client.id,
-          clientName: client.name,
+        linkedName = passenger.name;
+        addPassengerLedgerEntry({
+          passengerId: passenger.id,
+          passengerName: passenger.name,
           amount,
           concept: `Ingreso aplicado a cuenta corriente: ${concept}`,
           source: "pending_payment"
@@ -1509,6 +1798,18 @@ export default function Home() {
             Caja
           </button>
         ) : null}
+        {canCash ? (
+          <button
+            className={activeTab === "cashMovements" ? "active" : ""}
+            type="button"
+            onClick={() => {
+              setSelectedCashBoxFilter("all");
+              setActiveTab("cashMovements");
+            }}
+          >
+            Movimientos
+          </button>
+        ) : null}
         {canSettings ? (
           <button className={activeTab === "settings" ? "active" : ""} type="button" onClick={() => setActiveTab("settings")}>
             Configuracion
@@ -1537,7 +1838,17 @@ export default function Home() {
                 </select>
               </label>
               <label>
-                Cliente
+                Pasajero
+                <select value={selectedPassengerId} onChange={(event) => setSelectedPassengerId(event.target.value)}>
+                  {passengers.map((passenger) => (
+                    <option key={passenger.id} value={passenger.id}>
+                      {passenger.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Cliente / comisionista
                 <select value={selectedClientId} onChange={(event) => setSelectedClientId(event.target.value)}>
                   {clients.map((client) => (
                     <option key={client.id} value={client.id}>
@@ -1713,7 +2024,11 @@ export default function Home() {
                 <dd>{selectedDriver?.name || "-"}</dd>
               </div>
               <div>
-                <dt>Cliente</dt>
+                <dt>Pasajero</dt>
+                <dd>{selectedPassenger?.name || "-"}</dd>
+              </div>
+              <div>
+                <dt>Cliente / comisionista</dt>
                 <dd>{selectedClient?.name || "-"}</dd>
               </div>
               <div>
@@ -1779,6 +2094,7 @@ export default function Home() {
                   <tr>
                     <th>Fecha</th>
                     <th>Chofer</th>
+                    <th>Pasajero</th>
                     <th>Cliente</th>
                     <th>Recorrido</th>
                     <th>Cobro</th>
@@ -1791,10 +2107,32 @@ export default function Home() {
                     <tr key={trip.id}>
                       <td>{new Date(trip.createdAt).toLocaleString("es-AR")}</td>
                       <td>{trip.driverName}</td>
+                      <td>{trip.passengerName}</td>
                       <td>{trip.clientName}</td>
                       <td>{trip.origin} {" -> "} {trip.destination}</td>
-                      <td>{PAYMENT_OPTIONS.find((option) => option.value === trip.paymentMode)?.title || "-"}</td>
-                      <td>{formatCurrency(trip.totalAmount)}</td>
+                      <td>
+                        <select
+                          value={trip.paymentMode}
+                          onChange={(event) => updatePendingTripPayment(trip.id, event.target.value as PaymentMode)}
+                          aria-label={`Forma de cobro ${trip.id}`}
+                        >
+                          {PAYMENT_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.title}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td>
+                        <input
+                          type="number"
+                          min="0"
+                          step="1"
+                          value={trip.totalAmount}
+                          onChange={(event) => updatePendingTripAmount(trip.id, event.target.value)}
+                          aria-label={`Monto ${trip.id}`}
+                        />
+                      </td>
                       <td className="action-buttons">
                         <button type="button" onClick={() => confirmPendingTrip(trip.id)}>Confirmar</button>
                         <button className="secondary" type="button" onClick={() => declinePendingTrip(trip.id)}>
@@ -1840,6 +2178,7 @@ export default function Home() {
                     <tr>
                       <th>Fecha</th>
                       <th>Chofer</th>
+                      <th>Pasajero</th>
                       <th>Cliente</th>
                       <th>Cobro</th>
                       <th>Total</th>
@@ -1850,6 +2189,7 @@ export default function Home() {
                       <tr key={trip.id}>
                         <td>{new Date(trip.confirmedAt).toLocaleString("es-AR")}</td>
                         <td>{trip.driverName}</td>
+                        <td>{trip.passengerName}</td>
                         <td>{trip.clientName}</td>
                         <td>{PAYMENT_OPTIONS.find((option) => option.value === trip.paymentMode)?.title || "-"}</td>
                         <td>{formatCurrency(trip.totalAmount)}</td>
@@ -1893,7 +2233,32 @@ export default function Home() {
       {activeTab === "accounts" && canAccounts ? (
         <section className="panel grid-two">
           <article className="card">
-            <h2>Cuenta corriente de clientes</h2>
+            <h2>Cuenta corriente de pasajeros</h2>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Pasajero</th>
+                    <th>Saldo</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {passengerBalances.map((passenger) => (
+                    <tr key={passenger.id}>
+                      <td>{passenger.name}</td>
+                      <td className={passenger.balance >= 0 ? "balance-positive" : "balance-negative"}>
+                        {formatCurrency(passenger.balance)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="help-note">Saldo positivo: a favor del pasajero. Saldo negativo: pasajero adeuda.</p>
+          </article>
+
+          <article className="card">
+            <h2>Comisiones de clientes</h2>
             <div className="table-wrap">
               <table>
                 <thead>
@@ -1914,7 +2279,7 @@ export default function Home() {
                 </tbody>
               </table>
             </div>
-            <p className="help-note">Saldo positivo: a favor del cliente. Saldo negativo: cliente adeuda.</p>
+            <p className="help-note">Estos saldos corresponden a comisiones o movimientos del cliente/comisionista.</p>
           </article>
 
           <article className="card">
@@ -1993,11 +2358,11 @@ export default function Home() {
 
               {cashKind === "income" && incomeReason === "pending_payment" ? (
                 <label>
-                  Cliente
-                  <select value={cashClientId} onChange={(event) => setCashClientId(event.target.value)}>
-                    {clients.map((client) => (
-                      <option key={client.id} value={client.id}>
-                        {client.name}
+                  Pasajero
+                  <select value={cashPassengerId} onChange={(event) => setCashPassengerId(event.target.value)}>
+                    {passengers.map((passenger) => (
+                      <option key={passenger.id} value={passenger.id}>
+                        {passenger.name}
                       </option>
                     ))}
                   </select>
@@ -2026,7 +2391,7 @@ export default function Home() {
                 <input
                   type="number"
                   min="0"
-                  step="100"
+                  step="1"
                   value={getNumberInputValue("cashAmount", cashAmount)}
                   onFocus={() => setActiveNumberField("cashAmount")}
                   onBlur={() => setActiveNumberField(null)}
@@ -2045,22 +2410,50 @@ export default function Home() {
           <article className="card">
             <h2>Resumen de caja</h2>
             <div className="box-balance-grid">
-              <div className="box-balance-item">
+              <button
+                className="box-balance-item"
+                type="button"
+                onClick={() => {
+                  setSelectedCashBoxFilter("cash");
+                  setActiveTab("cashMovements");
+                }}
+              >
                 <span>Caja efectivo</span>
                 <strong>{formatCurrency(boxBalances.cash)}</strong>
-              </div>
-              <div className="box-balance-item">
+              </button>
+              <button
+                className="box-balance-item"
+                type="button"
+                onClick={() => {
+                  setSelectedCashBoxFilter("uber_cash");
+                  setActiveTab("cashMovements");
+                }}
+              >
                 <span>Caja efectivo Uber</span>
                 <strong>{formatCurrency(boxBalances.uber_cash)}</strong>
-              </div>
-              <div className="box-balance-item">
+              </button>
+              <button
+                className="box-balance-item"
+                type="button"
+                onClick={() => {
+                  setSelectedCashBoxFilter("mercado_pago");
+                  setActiveTab("cashMovements");
+                }}
+              >
                 <span>Caja Mercado Pago</span>
                 <strong>{formatCurrency(boxBalances.mercado_pago)}</strong>
-              </div>
-              <div className="box-balance-item">
+              </button>
+              <button
+                className="box-balance-item"
+                type="button"
+                onClick={() => {
+                  setSelectedCashBoxFilter("galicia_paul");
+                  setActiveTab("cashMovements");
+                }}
+              >
                 <span>Caja Banco Galicia Paul</span>
                 <strong>{formatCurrency(boxBalances.galicia_paul)}</strong>
-              </div>
+              </button>
             </div>
             <dl className="summary-list">
               <div>
@@ -2077,6 +2470,44 @@ export default function Home() {
               </div>
             </dl>
 
+            <button
+              className="secondary"
+              type="button"
+              onClick={() => {
+                setSelectedCashBoxFilter("all");
+                setActiveTab("cashMovements");
+              }}
+            >
+              Ver todos los movimientos
+            </button>
+          </article>
+        </section>
+      ) : null}
+
+      {activeTab === "cashMovements" && canCash ? (
+        <section className="panel">
+          <article className="card">
+            <div className="section-title-row">
+              <div>
+                <h2>Movimientos de caja</h2>
+                <p className="help-note">Filtra por caja o revisa todos los ingresos y egresos.</p>
+              </div>
+              <label className="compact-filter">
+                Caja
+                <select
+                  value={selectedCashBoxFilter}
+                  onChange={(event) => setSelectedCashBoxFilter(event.target.value as CashBox | "all")}
+                >
+                  <option value="all">Todas las cajas</option>
+                  {CASH_BOX_OPTIONS.map((box) => (
+                    <option key={box.value} value={box.value}>
+                      {box.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
             <div className="table-wrap">
               <table>
                 <thead>
@@ -2089,7 +2520,7 @@ export default function Home() {
                   </tr>
                 </thead>
                 <tbody>
-                  {cashEntries.map((entry) => (
+                  {filteredCashEntries.map((entry) => (
                     <tr key={entry.id}>
                       <td>{new Date(entry.createdAt).toLocaleString("es-AR")}</td>
                       <td>{getCashBoxLabel(entry.box)}</td>
@@ -2101,6 +2532,11 @@ export default function Home() {
                       <td>{formatCurrency(entry.amount)}</td>
                     </tr>
                   ))}
+                  {!filteredCashEntries.length ? (
+                    <tr>
+                      <td colSpan={5}>No hay movimientos para esta caja.</td>
+                    </tr>
+                  ) : null}
                 </tbody>
               </table>
             </div>
@@ -2358,6 +2794,37 @@ export default function Home() {
                 </tbody>
               </table>
             </div>
+
+            <h2 style={{ marginTop: "14px" }}>Pasajeros</h2>
+            <form className="form-grid" onSubmit={handleAddPassenger}>
+              <label>
+                Nombre del pasajero
+                <input value={newPassengerName} onChange={(event) => setNewPassengerName(event.target.value)} required />
+              </label>
+              <button type="submit">Agregar pasajero</button>
+            </form>
+            <div className="table-wrap" style={{ marginTop: "10px" }}>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Pasajero</th>
+                    <th>Accion</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {passengers.map((passenger) => (
+                    <tr key={passenger.id}>
+                      <td>{passenger.name}</td>
+                      <td>
+                        <button className="secondary" type="button" onClick={() => removePassenger(passenger.id)}>
+                          Eliminar
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </article>
 
           <article className="card">
@@ -2372,6 +2839,7 @@ export default function Home() {
                     <th>Caja</th>
                     <th>Config</th>
                     <th>Auditorias</th>
+                    <th>Acciones</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -2412,6 +2880,11 @@ export default function Home() {
                           checked={user.permissions.audits}
                           onChange={(event) => updatePermission(user.id, "audits", event.target.checked)}
                         />
+                      </td>
+                      <td>
+                        <button className="secondary" type="button" onClick={() => removeUser(user.id)}>
+                          Eliminar
+                        </button>
                       </td>
                     </tr>
                   ))}
