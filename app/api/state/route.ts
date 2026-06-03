@@ -47,7 +47,7 @@ function getSql() {
   return neon(databaseUrl);
 }
 
-async function ensureStateTable(sql: ReturnType<typeof neon>) {
+async function ensureStateTable(sql: ReturnType<typeof getSql>) {
   await sql`
     CREATE TABLE IF NOT EXISTS mi_chofer_state (
       id TEXT PRIMARY KEY,
